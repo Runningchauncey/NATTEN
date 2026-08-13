@@ -55,7 +55,7 @@ from natten.context import (
     use_deterministic_algorithms,
     use_kv_parallelism_in_fused_na,
 )
-from natten.functional import attention, merge_attentions, na1d, na2d, na3d
+from natten.functional import attention, merge_attentions, na1d, na2d, na3d, sparse_na2d
 from natten.modules import (
     NeighborhoodAttention1D,
     NeighborhoodAttention2D,
@@ -101,6 +101,7 @@ __all__ = [
     "na1d",
     "na2d",
     "na3d",
+    "sparse_na2d",
     "attention",
     "merge_attentions",
 ]

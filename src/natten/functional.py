@@ -24,8 +24,11 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
+from torch.amp import custom_bwd, custom_fwd
+from torch.autograd import Function
 
 from natten.attn_merge import merge_attentions
+from natten._libnatten import sparse_na2d_backward, sparse_na2d_forward
 from natten.backends import (
     choose_backend,
     choose_fmha_backend,
@@ -67,8 +70,204 @@ from natten.utils.checks import (
 
 logger = log.get_logger(__name__)
 
+amp_fwd = custom_fwd(device_type="cuda")
+amp_bwd = custom_bwd(device_type="cuda")
+
+
+class SparseNa2dAutogradFn(Function):
+    @staticmethod
+    @amp_fwd
+    def forward(
+        ctx,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        coords: Tensor,
+        kernel_size: Tuple[int, int],
+        scale: float,
+        use_bilinear: bool,
+        apply_key_rope: bool,
+        rope_theta: float,
+    ) -> Tuple[Tensor, Tensor]:
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        coords = coords.contiguous()
+
+        output, logsumexp = sparse_na2d_forward(
+            query,
+            key,
+            value,
+            coords,
+            list(kernel_size),
+            scale,
+            use_bilinear,
+            apply_key_rope,
+            rope_theta,
+        )
+
+        ctx.save_for_backward(query, key, value, coords, output, logsumexp)
+        ctx.kernel_size = kernel_size
+        ctx.scale = scale
+        ctx.use_bilinear = use_bilinear
+        ctx.apply_key_rope = apply_key_rope
+        ctx.rope_theta = rope_theta
+        return output, logsumexp
+
+    @staticmethod
+    @amp_bwd
+    def backward(ctx, grad_output: Tensor, grad_lse: Optional[Tensor] = None):
+        del grad_lse
+        query, key, value, coords, output, logsumexp = ctx.saved_tensors
+
+        grad_query, grad_key, grad_value = sparse_na2d_backward(
+            query,
+            key,
+            value,
+            coords,
+            output,
+            grad_output.contiguous(),
+            logsumexp,
+            list(ctx.kernel_size),
+            ctx.scale,
+            ctx.use_bilinear,
+            ctx.apply_key_rope,
+            ctx.rope_theta,
+        )
+
+        return grad_query, grad_key, grad_value, None, None, None, None, None, None
+
 
 # Standard Attention
+
+
+def sparse_na2d(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    kernel_size: Dimension2DTypeOrDed,
+    scale: Optional[float] = None,
+    sample_mode: str = "indexed",
+    apply_query_rope: bool = False,
+    apply_key_rope: bool = False,
+    rope_theta: float = 100.0,
+    apply_qk_norm: bool = False,
+    q_norm_weight: Optional[Tensor] = None,
+    k_norm_weight: Optional[Tensor] = None,
+    qk_norm_eps: float = 1e-6,
+    qk_norm_before_rope: bool = True,
+    return_lse: bool = False,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """Computes sparse coordinate-query 2-D neighborhood attention.
+
+    Args:
+        query: Sparse query tensor in heads-last layout `[batch, num_queries, heads, head_dim]`.
+        key: Dense key map in heads-last layout `[batch, height, width, heads, head_dim]`.
+        value: Dense value map in heads-last layout `[batch, height, width, heads, head_dim_value]`.
+        coords: Normalized query coordinates `[batch, num_queries, 2]`, ordered `[y, x]`.
+        kernel_size: Odd local neighborhood size `(height, width)`.
+        scale: Optional attention scale. Defaults to `head_dim ** -0.5`.
+        sample_mode: `"indexed"` for nearest-cell neighborhoods or `"bilinear"`
+            for bilinear sampled neighborhoods.
+        apply_query_rope: Whether to apply AnyUp-style 2-D RoPE to query
+            vectors. This currently uses the materialized PyTorch reference path.
+        apply_key_rope: Whether to apply AnyUp-style 2-D RoPE to sampled key
+            vectors before computing logits.
+        rope_theta: RoPE theta used when `apply_key_rope=True`.
+        apply_qk_norm: Whether to apply full-channel RMSNorm to query and sampled
+            key vectors before attention. When enabled, the current implementation
+            uses the materialized PyTorch reference path for exact autograd.
+        q_norm_weight: Optional RMSNorm affine weight for query, shape `[heads * head_dim]`.
+        k_norm_weight: Optional RMSNorm affine weight for key, shape `[heads * head_dim]`.
+        qk_norm_eps: RMSNorm epsilon.
+        qk_norm_before_rope: If true, key order is sample -> RMSNorm -> RoPE -> dot.
+            If false, order is RoPE -> RMSNorm -> dot.
+        return_lse: Whether to return per-query/head logsumexp.
+
+    Returns:
+        Tensor `[batch, num_queries, heads, head_dim_value]`, and optionally
+        logsumexp `[batch, num_queries, heads]`.
+    """
+    if isinstance(kernel_size, int):
+        kernel_size = (kernel_size, kernel_size)
+    else:
+        kernel_size = tuple(kernel_size)  # type: ignore[arg-type]
+    if len(kernel_size) != 2:
+        raise ValueError(f"sparse_na2d kernel_size must have two values, got {kernel_size}.")
+    if kernel_size[0] < 1 or kernel_size[1] < 1:
+        raise ValueError(f"sparse_na2d kernel sizes must be positive, got {kernel_size}.")
+    if kernel_size[0] % 2 != 1 or kernel_size[1] % 2 != 1:
+        raise ValueError(f"sparse_na2d requires odd kernel sizes, got {kernel_size}.")
+    if query.dim() != 4:
+        raise ValueError(f"query must be [B, N, heads, head_dim], got {query.shape}.")
+    if key.dim() != 5 or value.dim() != 5:
+        raise ValueError(
+            f"key/value must be [B, H, W, heads, dim], got {key.shape=} and {value.shape=}."
+        )
+    if coords.dim() != 3 or coords.shape[-1] != 2:
+        raise ValueError(f"coords must be [B, N, 2], got {coords.shape}.")
+    if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
+        raise ValueError("query, key, and value batch sizes must match.")
+    if query.shape[0] != coords.shape[0] or query.shape[1] != coords.shape[1]:
+        raise ValueError("coords must match query batch and sparse query dimensions.")
+    if key.shape[:3] != value.shape[:3]:
+        raise ValueError("key and value map shapes must match in batch, height, and width.")
+    if query.shape[2] != key.shape[3] or query.shape[2] != value.shape[3]:
+        raise ValueError("query, key, and value head counts must match.")
+    if query.shape[3] != key.shape[4]:
+        raise ValueError("query and key head dimensions must match.")
+    if query.dtype != key.dtype or query.dtype != value.dtype:
+        raise ValueError("query, key, and value dtypes must match.")
+    if sample_mode not in {"indexed", "bilinear"}:
+        raise ValueError(f"sample_mode must be 'indexed' or 'bilinear', got {sample_mode}.")
+    full_qk_dim = query.shape[2] * query.shape[3]
+    if (apply_query_rope or apply_key_rope) and full_qk_dim % 4 != 0:
+        raise ValueError("RoPE requires heads * head_dim to be divisible by 4.")
+    if q_norm_weight is not None and q_norm_weight.numel() != full_qk_dim:
+        raise ValueError(f"q_norm_weight must have {full_qk_dim} values, got {q_norm_weight.numel()}.")
+    if k_norm_weight is not None and k_norm_weight.numel() != full_qk_dim:
+        raise ValueError(f"k_norm_weight must have {full_qk_dim} values, got {k_norm_weight.numel()}.")
+
+    scale = scale or query.shape[-1] ** -0.5
+    if apply_qk_norm or apply_query_rope:
+        from natten.sparse_na2d_reference import sparse_na2d_pytorch
+
+        return sparse_na2d_pytorch(
+            query,
+            key,
+            value,
+            coords,
+            kernel_size,
+            scale=scale,
+            sample_mode=sample_mode,
+            apply_query_rope=apply_query_rope,
+            apply_key_rope=apply_key_rope,
+            rope_theta=rope_theta,
+            apply_qk_norm=True,
+            q_norm_weight=q_norm_weight,
+            k_norm_weight=k_norm_weight,
+            qk_norm_eps=qk_norm_eps,
+            qk_norm_before_rope=qk_norm_before_rope,
+            return_lse=return_lse,
+        )
+
+    use_bilinear = sample_mode == "bilinear"
+    output, lse = SparseNa2dAutogradFn.apply(
+        query,
+        key,
+        value,
+        coords,
+        kernel_size,
+        scale,
+        use_bilinear,
+        apply_key_rope,
+        float(rope_theta),
+    )
+
+    if return_lse:
+        return output, lse
+    return output
 
 
 def attention(

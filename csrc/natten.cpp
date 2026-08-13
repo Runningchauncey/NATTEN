@@ -128,6 +128,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "na3d_backward", &natten::na3d_backward, "NA3D backward (fused)");
 
+  m.def(
+      "sparse_na2d_forward", &natten::sparse_na2d_forward, "Sparse coordinate NA2D forward");
+
+  m.def(
+      "sparse_na2d_backward", &natten::sparse_na2d_backward, "Sparse coordinate NA2D backward");
+
   ////// SM50/SM70/SM75/SM80 - FMHA
   m.def(
       "fmha_forward", &natten::fmha_forward, "FMHA forward (fused)");

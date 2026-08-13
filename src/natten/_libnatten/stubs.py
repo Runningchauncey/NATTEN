@@ -50,6 +50,8 @@ na3d_forward = libnatten_import_error
 na1d_backward = libnatten_import_error
 na2d_backward = libnatten_import_error
 na3d_backward = libnatten_import_error
+sparse_na2d_forward = libnatten_import_error
+sparse_na2d_backward = libnatten_import_error
 
 # CUTLASS 3.X kernels
 ## SM90 - Hopper FMHA
