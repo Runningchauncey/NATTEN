@@ -28,7 +28,12 @@ from torch.amp import custom_bwd, custom_fwd
 from torch.autograd import Function
 
 from natten.attn_merge import merge_attentions
-from natten._libnatten import sparse_na2d_backward, sparse_na2d_forward
+from natten._libnatten import (
+    sparse_na2d_backward,
+    sparse_na2d_forward,
+    sparse_na2d_simple_backward,
+    sparse_na2d_simple_forward,
+)
 from natten.backends import (
     choose_backend,
     choose_fmha_backend,
@@ -138,6 +143,136 @@ class SparseNa2dAutogradFn(Function):
         return grad_query, grad_key, grad_value, None, None, None, None, None, None
 
 
+class SparseNa2dSimpleAutogradFn(Function):
+    @staticmethod
+    @amp_fwd
+    def forward(
+        ctx,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        coords: Tensor,
+        kernel_size: Tuple[int, int],
+        scale: float,
+    ) -> Tuple[Tensor, Tensor]:
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        coords = coords.contiguous()
+
+        output, logsumexp = sparse_na2d_simple_forward(
+            query,
+            key,
+            value,
+            coords,
+            list(kernel_size),
+            scale,
+        )
+
+        ctx.save_for_backward(query, key, value, coords, output, logsumexp)
+        ctx.kernel_size = kernel_size
+        ctx.scale = scale
+        return output, logsumexp
+
+    @staticmethod
+    @amp_bwd
+    def backward(ctx, grad_output: Tensor, grad_lse: Optional[Tensor] = None):
+        del grad_lse
+        query, key, value, coords, output, logsumexp = ctx.saved_tensors
+
+        grad_query, grad_key, grad_value = sparse_na2d_simple_backward(
+            query,
+            key,
+            value,
+            coords,
+            output,
+            grad_output.contiguous(),
+            logsumexp,
+            list(ctx.kernel_size),
+            ctx.scale,
+        )
+
+        return grad_query, grad_key, grad_value, None, None, None
+
+
+def _check_sparse_na2d_inputs(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    kernel_size: Dimension2DTypeOrDed,
+    op_name: str,
+) -> Tuple[int, int]:
+    if isinstance(kernel_size, int):
+        kernel_size = (kernel_size, kernel_size)
+    else:
+        kernel_size = tuple(kernel_size)  # type: ignore[arg-type]
+    if len(kernel_size) != 2:
+        raise ValueError(f"{op_name} kernel_size must have two values, got {kernel_size}.")
+    if kernel_size[0] < 1 or kernel_size[1] < 1:
+        raise ValueError(f"{op_name} kernel sizes must be positive, got {kernel_size}.")
+    if kernel_size[0] % 2 != 1 or kernel_size[1] % 2 != 1:
+        raise ValueError(f"{op_name} requires odd kernel sizes, got {kernel_size}.")
+    if query.dim() != 4:
+        raise ValueError(f"query must be [B, N, heads, head_dim], got {query.shape}.")
+    if key.dim() != 5 or value.dim() != 5:
+        raise ValueError(
+            f"key/value must be [B, H, W, heads, dim], got {key.shape=} and {value.shape=}."
+        )
+    if coords.dim() != 3 or coords.shape[-1] != 2:
+        raise ValueError(f"coords must be [B, N, 2], got {coords.shape}.")
+    if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
+        raise ValueError("query, key, and value batch sizes must match.")
+    if query.shape[0] != coords.shape[0] or query.shape[1] != coords.shape[1]:
+        raise ValueError("coords must match query batch and sparse query dimensions.")
+    if key.shape[:3] != value.shape[:3]:
+        raise ValueError("key and value map shapes must match in batch, height, and width.")
+    if query.shape[2] != key.shape[3] or query.shape[2] != value.shape[3]:
+        raise ValueError("query, key, and value head counts must match.")
+    if query.shape[3] != key.shape[4]:
+        raise ValueError("query and key head dimensions must match.")
+    if query.dtype != key.dtype or query.dtype != value.dtype:
+        raise ValueError("query, key, and value dtypes must match.")
+    return kernel_size
+
+
+def sparse_na2d_simple(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    kernel_size: Dimension2DTypeOrDed,
+    scale: Optional[float] = None,
+    return_lse: bool = False,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """Computes indexed sparse coordinate-query 2-D neighborhood attention.
+
+    This is a narrower variant of `sparse_na2d`: it only supports indexed
+    coordinate neighborhoods and does not apply RoPE or QK normalization.
+    """
+    kernel_size = _check_sparse_na2d_inputs(
+        query,
+        key,
+        value,
+        coords,
+        kernel_size,
+        op_name="sparse_na2d_simple",
+    )
+    scale = scale or query.shape[-1] ** -0.5
+    output, lse = SparseNa2dSimpleAutogradFn.apply(
+        query,
+        key,
+        value,
+        coords,
+        kernel_size,
+        scale,
+    )
+
+    if return_lse:
+        return output, lse
+    return output
+
+
 # Standard Attention
 
 
@@ -189,36 +324,14 @@ def sparse_na2d(
         Tensor `[batch, num_queries, heads, head_dim_value]`, and optionally
         logsumexp `[batch, num_queries, heads]`.
     """
-    if isinstance(kernel_size, int):
-        kernel_size = (kernel_size, kernel_size)
-    else:
-        kernel_size = tuple(kernel_size)  # type: ignore[arg-type]
-    if len(kernel_size) != 2:
-        raise ValueError(f"sparse_na2d kernel_size must have two values, got {kernel_size}.")
-    if kernel_size[0] < 1 or kernel_size[1] < 1:
-        raise ValueError(f"sparse_na2d kernel sizes must be positive, got {kernel_size}.")
-    if kernel_size[0] % 2 != 1 or kernel_size[1] % 2 != 1:
-        raise ValueError(f"sparse_na2d requires odd kernel sizes, got {kernel_size}.")
-    if query.dim() != 4:
-        raise ValueError(f"query must be [B, N, heads, head_dim], got {query.shape}.")
-    if key.dim() != 5 or value.dim() != 5:
-        raise ValueError(
-            f"key/value must be [B, H, W, heads, dim], got {key.shape=} and {value.shape=}."
-        )
-    if coords.dim() != 3 or coords.shape[-1] != 2:
-        raise ValueError(f"coords must be [B, N, 2], got {coords.shape}.")
-    if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
-        raise ValueError("query, key, and value batch sizes must match.")
-    if query.shape[0] != coords.shape[0] or query.shape[1] != coords.shape[1]:
-        raise ValueError("coords must match query batch and sparse query dimensions.")
-    if key.shape[:3] != value.shape[:3]:
-        raise ValueError("key and value map shapes must match in batch, height, and width.")
-    if query.shape[2] != key.shape[3] or query.shape[2] != value.shape[3]:
-        raise ValueError("query, key, and value head counts must match.")
-    if query.shape[3] != key.shape[4]:
-        raise ValueError("query and key head dimensions must match.")
-    if query.dtype != key.dtype or query.dtype != value.dtype:
-        raise ValueError("query, key, and value dtypes must match.")
+    kernel_size = _check_sparse_na2d_inputs(
+        query,
+        key,
+        value,
+        coords,
+        kernel_size,
+        op_name="sparse_na2d",
+    )
     if sample_mode not in {"indexed", "bilinear"}:
         raise ValueError(f"sample_mode must be 'indexed' or 'bilinear', got {sample_mode}.")
     full_qk_dim = query.shape[2] * query.shape[3]

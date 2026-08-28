@@ -38,6 +38,7 @@ namespace natten {
 namespace {
 
 constexpr int kThreads = 256;
+constexpr int kSimpleThreads = 64;
 
 template <typename scalar_t>
 __device__ inline float load_as_float(const scalar_t* ptr) {
@@ -391,46 +392,47 @@ __global__ void sparse_na2d_forward_kernel(
   init_rope_freqs(rope_freqs, heads * dim, rope_theta);
   __syncthreads();
 
+  for (int offset_idx = threadIdx.x; offset_idx < k_tokens; offset_idx += blockDim.x) {
+    int oy = (offset_idx / kernel_w) - (kernel_h / 2);
+    int ox = (offset_idx % kernel_w) - (kernel_w / 2);
+    int y = max(0, min(center_y + oy, height - 1));
+    int x = max(0, min(center_x + ox, width - 1));
+    float yf = fminf(fmaxf(center_yf + static_cast<float>(oy), 0.0f), static_cast<float>(height - 1));
+    float xf = fminf(fmaxf(center_xf + static_cast<float>(ox), 0.0f), static_cast<float>(width - 1));
+    float pos_y = (use_bilinear ? yf : static_cast<float>(y)) / static_cast<float>(max(height - 1, 1));
+    float pos_x = (use_bilinear ? xf : static_cast<float>(x)) / static_cast<float>(max(width - 1, 1));
+    float logit = 0.0f;
+    for (int d = 0; d < dim; ++d) {
+      float kval = maybe_rope_key_load(
+          key,
+          batch_idx,
+          height,
+          width,
+          heads,
+          head_idx,
+          dim,
+          d,
+          y,
+          x,
+          yf,
+          xf,
+          use_bilinear,
+          apply_key_rope,
+          pos_y,
+          pos_x,
+          rope_theta,
+          rope_freqs);
+      logit += load_as_float(q_ptr + d) * kval;
+    }
+    probs[offset_idx] = logit * scale;
+  }
+  __syncthreads();
+
   if (threadIdx.x == 0) {
     float max_logit = -INFINITY;
-    int offset_idx = 0;
-    for (int oy = -(kernel_h / 2); oy <= kernel_h / 2; ++oy) {
-      int y = max(0, min(center_y + oy, height - 1));
-      float yf = fminf(fmaxf(center_yf + static_cast<float>(oy), 0.0f), static_cast<float>(height - 1));
-      for (int ox = -(kernel_w / 2); ox <= kernel_w / 2; ++ox, ++offset_idx) {
-        int x = max(0, min(center_x + ox, width - 1));
-        float xf = fminf(fmaxf(center_xf + static_cast<float>(ox), 0.0f), static_cast<float>(width - 1));
-        float pos_y = (use_bilinear ? yf : static_cast<float>(y)) / static_cast<float>(max(height - 1, 1));
-        float pos_x = (use_bilinear ? xf : static_cast<float>(x)) / static_cast<float>(max(width - 1, 1));
-        float logit = 0.0f;
-        for (int d = 0; d < dim; ++d) {
-          float kval = maybe_rope_key_load(
-              key,
-              batch_idx,
-              height,
-              width,
-              heads,
-              head_idx,
-              dim,
-              d,
-              y,
-              x,
-              yf,
-              xf,
-              use_bilinear,
-              apply_key_rope,
-              pos_y,
-              pos_x,
-              rope_theta,
-              rope_freqs);
-          logit += load_as_float(q_ptr + d) * kval;
-        }
-        logit *= scale;
-        probs[offset_idx] = logit;
-        max_logit = fmaxf(max_logit, logit);
-      }
+    for (int i = 0; i < k_tokens; ++i) {
+      max_logit = fmaxf(max_logit, probs[i]);
     }
-
     float denom = 0.0f;
     for (int i = 0; i < k_tokens; ++i) {
       float p = expf(probs[i] - max_logit);
@@ -521,43 +523,40 @@ __global__ void sparse_na2d_backward_kernel(
   init_rope_freqs(rope_freqs, heads * dim, rope_theta);
   __syncthreads();
 
-  if (threadIdx.x == 0) {
-    int offset_idx = 0;
-    for (int oy = -(kernel_h / 2); oy <= kernel_h / 2; ++oy) {
-      int y = max(0, min(center_y + oy, height - 1));
-      float yf = fminf(fmaxf(center_yf + static_cast<float>(oy), 0.0f), static_cast<float>(height - 1));
-      for (int ox = -(kernel_w / 2); ox <= kernel_w / 2; ++ox, ++offset_idx) {
-        int x = max(0, min(center_x + ox, width - 1));
-        float xf = fminf(fmaxf(center_xf + static_cast<float>(ox), 0.0f), static_cast<float>(width - 1));
-        float pos_y = (use_bilinear ? yf : static_cast<float>(y)) / static_cast<float>(max(height - 1, 1));
-        float pos_x = (use_bilinear ? xf : static_cast<float>(x)) / static_cast<float>(max(width - 1, 1));
-        float logit = 0.0f;
-        for (int d = 0; d < dim; ++d) {
-          float kval = maybe_rope_key_load(
-              key,
-              batch_idx,
-              height,
-              width,
-              heads,
-              head_idx,
-              dim,
-              d,
-              y,
-              x,
-              yf,
-              xf,
-              use_bilinear,
-              apply_key_rope,
-              pos_y,
-              pos_x,
-              rope_theta,
-              rope_freqs);
-          logit += load_as_float(q_ptr + d) * kval;
-        }
-        probs[offset_idx] = expf(logit * scale - lse);
-        dp[offset_idx] = 0.0f;
-      }
+  for (int offset_idx = threadIdx.x; offset_idx < k_tokens; offset_idx += blockDim.x) {
+    int oy = (offset_idx / kernel_w) - (kernel_h / 2);
+    int ox = (offset_idx % kernel_w) - (kernel_w / 2);
+    int y = max(0, min(center_y + oy, height - 1));
+    int x = max(0, min(center_x + ox, width - 1));
+    float yf = fminf(fmaxf(center_yf + static_cast<float>(oy), 0.0f), static_cast<float>(height - 1));
+    float xf = fminf(fmaxf(center_xf + static_cast<float>(ox), 0.0f), static_cast<float>(width - 1));
+    float pos_y = (use_bilinear ? yf : static_cast<float>(y)) / static_cast<float>(max(height - 1, 1));
+    float pos_x = (use_bilinear ? xf : static_cast<float>(x)) / static_cast<float>(max(width - 1, 1));
+    float logit = 0.0f;
+    for (int d = 0; d < dim; ++d) {
+      float kval = maybe_rope_key_load(
+          key,
+          batch_idx,
+          height,
+          width,
+          heads,
+          head_idx,
+          dim,
+          d,
+          y,
+          x,
+          yf,
+          xf,
+          use_bilinear,
+          apply_key_rope,
+          pos_y,
+          pos_x,
+          rope_theta,
+          rope_freqs);
+      logit += load_as_float(q_ptr + d) * kval;
     }
+    probs[offset_idx] = expf(logit * scale - lse);
+    dp[offset_idx] = 0.0f;
   }
   __syncthreads();
 
@@ -690,6 +689,224 @@ __global__ void sparse_na2d_backward_kernel(
   }
 }
 
+template <typename scalar_t, typename coord_t>
+__global__ void sparse_na2d_simple_forward_kernel(
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    const coord_t* __restrict__ coords,
+    scalar_t* __restrict__ out,
+    float* __restrict__ logsumexp,
+    int batch,
+    int num_queries,
+    int height,
+    int width,
+    int heads,
+    int dim,
+    int dim_value,
+    int kernel_h,
+    int kernel_w,
+    float scale) {
+  extern __shared__ float probs[];
+
+  int query_idx = blockIdx.x;
+  int head_idx = blockIdx.y;
+  int batch_idx = blockIdx.z;
+  int k_tokens = kernel_h * kernel_w;
+
+  const scalar_t* q_ptr =
+      query + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim);
+  const coord_t* coord_ptr = coords + ((batch_idx * num_queries + query_idx) * 2);
+  int center_y = coord_to_index(coord_ptr[0], height);
+  int center_x = coord_to_index(coord_ptr[1], width);
+
+  for (int offset_idx = threadIdx.x; offset_idx < k_tokens; offset_idx += blockDim.x) {
+    int oy = (offset_idx / kernel_w) - (kernel_h / 2);
+    int ox = (offset_idx % kernel_w) - (kernel_w / 2);
+    int y = max(0, min(center_y + oy, height - 1));
+    int x = max(0, min(center_x + ox, width - 1));
+    const scalar_t* k_ptr =
+        key + ((((batch_idx * height + y) * width + x) * heads + head_idx) * dim);
+
+    float logit = 0.0f;
+    for (int d = 0; d < dim; ++d) {
+      logit += load_as_float(q_ptr + d) * load_as_float(k_ptr + d);
+    }
+    probs[offset_idx] = logit * scale;
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    float max_logit = -INFINITY;
+    for (int i = 0; i < k_tokens; ++i) {
+      max_logit = fmaxf(max_logit, probs[i]);
+    }
+    float denom = 0.0f;
+    for (int i = 0; i < k_tokens; ++i) {
+      float p = expf(probs[i] - max_logit);
+      probs[i] = p;
+      denom += p;
+    }
+    float inv_denom = 1.0f / denom;
+    for (int i = 0; i < k_tokens; ++i) {
+      probs[i] *= inv_denom;
+    }
+    logsumexp[(batch_idx * num_queries + query_idx) * heads + head_idx] =
+        logf(denom) + max_logit;
+  }
+  __syncthreads();
+
+  scalar_t* out_ptr =
+      out + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim_value);
+  for (int dv = threadIdx.x; dv < dim_value; dv += blockDim.x) {
+    float acc = 0.0f;
+    int offset_idx = 0;
+    for (int oy = -(kernel_h / 2); oy <= kernel_h / 2; ++oy) {
+      int y = max(0, min(center_y + oy, height - 1));
+      for (int ox = -(kernel_w / 2); ox <= kernel_w / 2; ++ox, ++offset_idx) {
+        int x = max(0, min(center_x + ox, width - 1));
+        const scalar_t* v_ptr =
+            value + ((((batch_idx * height + y) * width + x) * heads + head_idx) * dim_value);
+        acc += probs[offset_idx] * load_as_float(v_ptr + dv);
+      }
+    }
+    out_ptr[dv] = static_cast<scalar_t>(acc);
+  }
+}
+
+template <typename scalar_t, typename coord_t>
+__global__ void sparse_na2d_simple_backward_kernel(
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    const coord_t* __restrict__ coords,
+    const scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ grad_out,
+    const float* __restrict__ logsumexp,
+    scalar_t* __restrict__ grad_query,
+    scalar_t* __restrict__ grad_key,
+    scalar_t* __restrict__ grad_value,
+    int batch,
+    int num_queries,
+    int height,
+    int width,
+    int heads,
+    int dim,
+    int dim_value,
+    int kernel_h,
+    int kernel_w,
+    float scale) {
+  extern __shared__ float smem[];
+  float* probs = smem;
+  float* dp = smem + kernel_h * kernel_w;
+  float* reductions = dp + kernel_h * kernel_w;
+
+  int query_idx = blockIdx.x;
+  int head_idx = blockIdx.y;
+  int batch_idx = blockIdx.z;
+  int k_tokens = kernel_h * kernel_w;
+
+  const scalar_t* q_ptr =
+      query + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim);
+  const scalar_t* o_ptr =
+      out + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim_value);
+  const scalar_t* go_ptr =
+      grad_out + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim_value);
+  const coord_t* coord_ptr = coords + ((batch_idx * num_queries + query_idx) * 2);
+  int center_y = coord_to_index(coord_ptr[0], height);
+  int center_x = coord_to_index(coord_ptr[1], width);
+  float lse = logsumexp[(batch_idx * num_queries + query_idx) * heads + head_idx];
+
+  for (int offset_idx = threadIdx.x; offset_idx < k_tokens; offset_idx += blockDim.x) {
+    int oy = (offset_idx / kernel_w) - (kernel_h / 2);
+    int ox = (offset_idx % kernel_w) - (kernel_w / 2);
+    int y = max(0, min(center_y + oy, height - 1));
+    int x = max(0, min(center_x + ox, width - 1));
+    const scalar_t* k_ptr =
+        key + ((((batch_idx * height + y) * width + x) * heads + head_idx) * dim);
+
+    float logit = 0.0f;
+    for (int d = 0; d < dim; ++d) {
+      logit += load_as_float(q_ptr + d) * load_as_float(k_ptr + d);
+    }
+    probs[offset_idx] = expf(logit * scale - lse);
+    dp[offset_idx] = 0.0f;
+  }
+  __syncthreads();
+
+  float delta_part = 0.0f;
+  for (int dv = threadIdx.x; dv < dim_value; dv += blockDim.x) {
+    delta_part += load_as_float(go_ptr + dv) * load_as_float(o_ptr + dv);
+  }
+  reductions[threadIdx.x] = delta_part;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reductions[threadIdx.x] += reductions[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  float delta = reductions[0];
+
+  for (int offset_idx = 0; offset_idx < k_tokens; ++offset_idx) {
+    int oy = (offset_idx / kernel_w) - (kernel_h / 2);
+    int ox = (offset_idx % kernel_w) - (kernel_w / 2);
+    int y = max(0, min(center_y + oy, height - 1));
+    int x = max(0, min(center_x + ox, width - 1));
+    const scalar_t* v_ptr =
+        value + ((((batch_idx * height + y) * width + x) * heads + head_idx) * dim_value);
+
+    float dp_part = 0.0f;
+    for (int dv = threadIdx.x; dv < dim_value; dv += blockDim.x) {
+      float vval = load_as_float(v_ptr + dv);
+      dp_part += load_as_float(go_ptr + dv) * vval;
+      float gv = probs[offset_idx] * load_as_float(go_ptr + dv);
+      at::native::fastAtomicAdd(
+          grad_value,
+          ((((batch_idx * height + y) * width + x) * heads + head_idx) * dim_value) + dv,
+          batch * height * width * heads * dim_value,
+          static_cast<scalar_t>(gv),
+          true);
+    }
+    reductions[threadIdx.x] = dp_part;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        reductions[threadIdx.x] += reductions[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      dp[offset_idx] = probs[offset_idx] * (reductions[0] - delta) * scale;
+    }
+    __syncthreads();
+  }
+
+  scalar_t* gq_ptr =
+      grad_query + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim);
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int offset_idx = 0; offset_idx < k_tokens; ++offset_idx) {
+      int oy = (offset_idx / kernel_w) - (kernel_h / 2);
+      int ox = (offset_idx % kernel_w) - (kernel_w / 2);
+      int y = max(0, min(center_y + oy, height - 1));
+      int x = max(0, min(center_x + ox, width - 1));
+      const scalar_t* k_ptr =
+          key + ((((batch_idx * height + y) * width + x) * heads + head_idx) * dim);
+      acc += dp[offset_idx] * load_as_float(k_ptr + d);
+      float gk = dp[offset_idx] * load_as_float(q_ptr + d);
+      at::native::fastAtomicAdd(
+          grad_key,
+          ((((batch_idx * height + y) * width + x) * heads + head_idx) * dim) + d,
+          batch * height * width * heads * dim,
+          static_cast<scalar_t>(gk),
+          true);
+    }
+    gq_ptr[d] = static_cast<scalar_t>(acc);
+  }
+}
+
 void check_sparse_na2d_args(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -811,6 +1028,72 @@ void sparse_na2d_forward(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void sparse_na2d_simple_forward(
+    at::Tensor& out,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& coords,
+    at::Tensor& logsumexp,
+    const std::tuple<int32_t, int32_t>& kernel_size,
+    float attn_scale) {
+  check_sparse_na2d_args(query, key, value, coords, kernel_size);
+  CHECK_CONTIGUOUS(out);
+  CHECK_CONTIGUOUS(logsumexp);
+  CHECK_CUDA(out);
+  CHECK_CUDA(logsumexp);
+
+  at::cuda::OptionalCUDAGuard device_guard(query.device());
+  const int batch = query.size(0);
+  const int num_queries = query.size(1);
+  const int height = key.size(1);
+  const int width = key.size(2);
+  const int heads = query.size(2);
+  const int dim = query.size(3);
+  const int dim_value = value.size(4);
+  const int kernel_h = std::get<0>(kernel_size);
+  const int kernel_w = std::get<1>(kernel_size);
+
+  dim3 grid(num_queries, heads, batch);
+  size_t smem_bytes = kernel_h * kernel_w * sizeof(float);
+  auto stream = at::cuda::getCurrentCUDAStream(query.device().index());
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      query.scalar_type(),
+      "sparse_na2d_simple_forward",
+      [&] {
+        using q_scalar_t = scalar_t;
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half,
+            at::ScalarType::BFloat16,
+            coords.scalar_type(),
+            "sparse_na2d_simple_forward_coords",
+            [&] {
+              using coord_scalar_t = scalar_t;
+              sparse_na2d_simple_forward_kernel<q_scalar_t, coord_scalar_t>
+                  <<<grid, kSimpleThreads, smem_bytes, stream>>>(
+                      query.data_ptr<q_scalar_t>(),
+                      key.data_ptr<q_scalar_t>(),
+                      value.data_ptr<q_scalar_t>(),
+                      coords.data_ptr<coord_scalar_t>(),
+                      out.data_ptr<q_scalar_t>(),
+                      logsumexp.data_ptr<float>(),
+                      batch,
+                      num_queries,
+                      height,
+                      width,
+                      heads,
+                      dim,
+                      dim_value,
+                      kernel_h,
+                      kernel_w,
+                      attn_scale);
+            });
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void sparse_na2d_backward(
     at::Tensor& grad_query,
     at::Tensor& grad_key,
@@ -900,6 +1183,91 @@ void sparse_na2d_backward(
                   use_bilinear,
                   apply_key_rope,
                   rope_theta);
+            });
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void sparse_na2d_simple_backward(
+    at::Tensor& grad_query,
+    at::Tensor& grad_key,
+    at::Tensor& grad_value,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& coords,
+    const at::Tensor& out,
+    const at::Tensor& grad_out,
+    const at::Tensor& logsumexp,
+    const std::tuple<int32_t, int32_t>& kernel_size,
+    float attn_scale) {
+  check_sparse_na2d_args(query, key, value, coords, kernel_size);
+  CHECK_CONTIGUOUS(grad_query);
+  CHECK_CONTIGUOUS(grad_key);
+  CHECK_CONTIGUOUS(grad_value);
+  CHECK_CONTIGUOUS(out);
+  CHECK_CONTIGUOUS(grad_out);
+  CHECK_CONTIGUOUS(logsumexp);
+  CHECK_CUDA(grad_query);
+  CHECK_CUDA(grad_key);
+  CHECK_CUDA(grad_value);
+  CHECK_CUDA(out);
+  CHECK_CUDA(grad_out);
+  CHECK_CUDA(logsumexp);
+
+  grad_key.zero_();
+  grad_value.zero_();
+
+  at::cuda::OptionalCUDAGuard device_guard(query.device());
+  const int batch = query.size(0);
+  const int num_queries = query.size(1);
+  const int height = key.size(1);
+  const int width = key.size(2);
+  const int heads = query.size(2);
+  const int dim = query.size(3);
+  const int dim_value = value.size(4);
+  const int kernel_h = std::get<0>(kernel_size);
+  const int kernel_w = std::get<1>(kernel_size);
+
+  dim3 grid(num_queries, heads, batch);
+  size_t smem_bytes = (2 * kernel_h * kernel_w + kSimpleThreads) * sizeof(float);
+  auto stream = at::cuda::getCurrentCUDAStream(query.device().index());
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      query.scalar_type(),
+      "sparse_na2d_simple_backward",
+      [&] {
+        using q_scalar_t = scalar_t;
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half,
+            at::ScalarType::BFloat16,
+            coords.scalar_type(),
+            "sparse_na2d_simple_backward_coords",
+            [&] {
+              using coord_scalar_t = scalar_t;
+              sparse_na2d_simple_backward_kernel<q_scalar_t, coord_scalar_t>
+                  <<<grid, kSimpleThreads, smem_bytes, stream>>>(
+                      query.data_ptr<q_scalar_t>(),
+                      key.data_ptr<q_scalar_t>(),
+                      value.data_ptr<q_scalar_t>(),
+                      coords.data_ptr<coord_scalar_t>(),
+                      out.data_ptr<q_scalar_t>(),
+                      grad_out.data_ptr<q_scalar_t>(),
+                      logsumexp.data_ptr<float>(),
+                      grad_query.data_ptr<q_scalar_t>(),
+                      grad_key.data_ptr<q_scalar_t>(),
+                      grad_value.data_ptr<q_scalar_t>(),
+                      batch,
+                      num_queries,
+                      height,
+                      width,
+                      heads,
+                      dim,
+                      dim_value,
+                      kernel_h,
+                      kernel_w,
+                      attn_scale);
             });
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
