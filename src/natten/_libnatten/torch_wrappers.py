@@ -59,6 +59,8 @@ from natten.libnatten import (  # type: ignore[import-untyped]
     reference_na2d_forward as reference_na2d_forward_cxx,
     reference_na3d_backward as reference_na3d_backward_cxx,
     reference_na3d_forward as reference_na3d_forward_cxx,
+    sparse_na2d_bilinear_backward as sparse_na2d_bilinear_backward_cxx,
+    sparse_na2d_bilinear_forward as sparse_na2d_bilinear_forward_cxx,
     sparse_na2d_backward as sparse_na2d_backward_cxx,
     sparse_na2d_forward as sparse_na2d_forward_cxx,
     sparse_na2d_simple_backward as sparse_na2d_simple_backward_cxx,
@@ -1480,6 +1482,133 @@ def sparse_na2d_simple_backward_torch_fake_op(
     return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
 
 
+@register_op(
+    "natten::sparse_na2d_bilinear_forward",
+    mutates_args=(),
+    device_types="cuda",
+)
+def sparse_na2d_bilinear_forward_torch_op(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    kernel_size: list[int],
+    scale: float,
+) -> Tuple[Tensor, Tensor]:
+    query, key, value, coords = [
+        maybe_contiguous(x) for x in (query, key, value, coords)
+    ]
+
+    output = torch.empty(
+        [query.shape[0], query.shape[1], query.shape[2], value.shape[-1]],
+        device=query.device,
+        dtype=query.dtype,
+    )
+    logsumexp = torch.empty(
+        query.shape[:-1], dtype=torch.float32, device=query.device
+    )
+
+    sparse_na2d_bilinear_forward_cxx(
+        output,
+        query,
+        key,
+        value,
+        coords,
+        logsumexp,
+        kernel_size,
+        scale,
+    )
+
+    return output, logsumexp
+
+
+@register_fake("natten::sparse_na2d_bilinear_forward")
+def sparse_na2d_bilinear_forward_torch_fake_op(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    kernel_size: list[int],
+    scale: float,
+) -> Tuple[Tensor, Tensor]:
+    query, key, value, coords = [
+        maybe_contiguous(x) for x in (query, key, value, coords)
+    ]
+
+    output = torch.empty(
+        [query.shape[0], query.shape[1], query.shape[2], value.shape[-1]],
+        device=query.device,
+        dtype=query.dtype,
+    )
+    logsumexp = torch.empty(
+        query.shape[:-1], dtype=torch.float32, device=query.device
+    )
+
+    return output, logsumexp
+
+
+@register_op(
+    "natten::sparse_na2d_bilinear_backward",
+    mutates_args=(),
+    device_types="cuda",
+)
+def sparse_na2d_bilinear_backward_torch_op(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    output: Tensor,
+    d_output: Tensor,
+    logsumexp: Tensor,
+    kernel_size: list[int],
+    scale: float,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    query, key, value, coords = [
+        maybe_contiguous(x) for x in (query, key, value, coords)
+    ]
+    output, d_output, logsumexp = [
+        maybe_contiguous(x) for x in (output, d_output, logsumexp)
+    ]
+
+    d_query = torch.empty_like(query)
+    d_key = torch.empty_like(key)
+    d_value = torch.empty_like(value)
+
+    sparse_na2d_bilinear_backward_cxx(
+        d_query,
+        d_key,
+        d_value,
+        query,
+        key,
+        value,
+        coords,
+        output,
+        d_output,
+        logsumexp,
+        kernel_size,
+        scale,
+    )
+
+    return d_query, d_key, d_value
+
+
+@register_fake("natten::sparse_na2d_bilinear_backward")
+def sparse_na2d_bilinear_backward_torch_fake_op(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    output: Tensor,
+    d_output: Tensor,
+    logsumexp: Tensor,
+    kernel_size: list[int],
+    scale: float,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    query, key, value = [maybe_contiguous(x) for x in (query, key, value)]
+
+    return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
+
+
 def make_reference_fna_ops(na_dim):
     fwd_handle, bwd_handle = {
         1: (reference_na1d_forward_cxx, reference_na1d_backward_cxx),
@@ -1956,6 +2085,8 @@ if DISABLE_TORCH_OPS:
     sparse_na2d_backward = sparse_na2d_backward_torch_op
     sparse_na2d_simple_forward = sparse_na2d_simple_forward_torch_op
     sparse_na2d_simple_backward = sparse_na2d_simple_backward_torch_op
+    sparse_na2d_bilinear_forward = sparse_na2d_bilinear_forward_torch_op
+    sparse_na2d_bilinear_backward = sparse_na2d_bilinear_backward_torch_op
 
     reference_na1d_forward = reference_na1d_forward_torch_op
     reference_na1d_backward = reference_na1d_backward_torch_op
@@ -2016,6 +2147,8 @@ else:
     sparse_na2d_backward = torch.ops.natten.sparse_na2d_backward
     sparse_na2d_simple_forward = torch.ops.natten.sparse_na2d_simple_forward
     sparse_na2d_simple_backward = torch.ops.natten.sparse_na2d_simple_backward
+    sparse_na2d_bilinear_forward = torch.ops.natten.sparse_na2d_bilinear_forward
+    sparse_na2d_bilinear_backward = torch.ops.natten.sparse_na2d_bilinear_backward
 
     reference_na1d_forward = torch.ops.natten.reference_na1d_forward
     reference_na1d_backward = torch.ops.natten.reference_na1d_backward
@@ -2066,6 +2199,8 @@ __all__ = [
     "na3d_forward",
     "sparse_na2d_backward",
     "sparse_na2d_forward",
+    "sparse_na2d_bilinear_backward",
+    "sparse_na2d_bilinear_forward",
     "sparse_na2d_simple_backward",
     "sparse_na2d_simple_forward",
     "reference_na1d_backward",

@@ -29,6 +29,8 @@ from torch.autograd import Function
 
 from natten.attn_merge import merge_attentions
 from natten._libnatten import (
+    sparse_na2d_bilinear_backward,
+    sparse_na2d_bilinear_forward,
     sparse_na2d_backward,
     sparse_na2d_forward,
     sparse_na2d_simple_backward,
@@ -195,6 +197,58 @@ class SparseNa2dSimpleAutogradFn(Function):
         return grad_query, grad_key, grad_value, None, None, None
 
 
+class SparseNa2dBilinearAutogradFn(Function):
+    @staticmethod
+    @amp_fwd
+    def forward(
+        ctx,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        coords: Tensor,
+        kernel_size: Tuple[int, int],
+        scale: float,
+    ) -> Tuple[Tensor, Tensor]:
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        coords = coords.contiguous()
+
+        output, logsumexp = sparse_na2d_bilinear_forward(
+            query,
+            key,
+            value,
+            coords,
+            list(kernel_size),
+            scale,
+        )
+
+        ctx.save_for_backward(query, key, value, coords, output, logsumexp)
+        ctx.kernel_size = kernel_size
+        ctx.scale = scale
+        return output, logsumexp
+
+    @staticmethod
+    @amp_bwd
+    def backward(ctx, grad_output: Tensor, grad_lse: Optional[Tensor] = None):
+        del grad_lse
+        query, key, value, coords, output, logsumexp = ctx.saved_tensors
+
+        grad_query, grad_key, grad_value = sparse_na2d_bilinear_backward(
+            query,
+            key,
+            value,
+            coords,
+            output,
+            grad_output.contiguous(),
+            logsumexp,
+            list(ctx.kernel_size),
+            ctx.scale,
+        )
+
+        return grad_query, grad_key, grad_value, None, None, None
+
+
 def _check_sparse_na2d_inputs(
     query: Tensor,
     key: Tensor,
@@ -260,6 +314,43 @@ def sparse_na2d_simple(
     )
     scale = scale or query.shape[-1] ** -0.5
     output, lse = SparseNa2dSimpleAutogradFn.apply(
+        query,
+        key,
+        value,
+        coords,
+        kernel_size,
+        scale,
+    )
+
+    if return_lse:
+        return output, lse
+    return output
+
+
+def sparse_na2d_bilinear(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    kernel_size: Dimension2DTypeOrDed,
+    scale: Optional[float] = None,
+    return_lse: bool = False,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """Computes bilinear sparse coordinate-query 2-D neighborhood attention.
+
+    This is a narrower variant of `sparse_na2d`: it only supports bilinear
+    coordinate neighborhoods and does not apply RoPE or QK normalization.
+    """
+    kernel_size = _check_sparse_na2d_inputs(
+        query,
+        key,
+        value,
+        coords,
+        kernel_size,
+        op_name="sparse_na2d_bilinear",
+    )
+    scale = scale or query.shape[-1] ** -0.5
+    output, lse = SparseNa2dBilinearAutogradFn.apply(
         query,
         key,
         value,

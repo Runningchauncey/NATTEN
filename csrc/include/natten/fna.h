@@ -98,6 +98,16 @@ void sparse_na2d_simple_forward(
     const std::tuple<int32_t, int32_t>& kernel_size,
     float attn_scale);
 
+void sparse_na2d_bilinear_forward(
+    at::Tensor& out,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& coords,
+    at::Tensor& logsumexp,
+    const std::tuple<int32_t, int32_t>& kernel_size,
+    float attn_scale);
+
 // Backward
 
 void na1d_backward(
@@ -178,6 +188,20 @@ void sparse_na2d_backward(
     float rope_theta);
 
 void sparse_na2d_simple_backward(
+    at::Tensor& grad_query,
+    at::Tensor& grad_key,
+    at::Tensor& grad_value,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& coords,
+    const at::Tensor& out,
+    const at::Tensor& grad_out,
+    const at::Tensor& logsumexp,
+    const std::tuple<int32_t, int32_t>& kernel_size,
+    float attn_scale);
+
+void sparse_na2d_bilinear_backward(
     at::Tensor& grad_query,
     at::Tensor& grad_key,
     at::Tensor& grad_value,

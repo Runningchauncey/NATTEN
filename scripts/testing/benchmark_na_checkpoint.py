@@ -32,6 +32,7 @@ from torch.utils.checkpoint import checkpoint
 
 import natten
 from natten import sparse_na2d as natten_sparse_na2d
+from natten import sparse_na2d_bilinear as natten_sparse_na2d_bilinear
 from natten import sparse_na2d_simple as natten_sparse_na2d_simple
 from natten.functional import neighborhood_attention_generic
 
@@ -277,6 +278,21 @@ def benchmark_case(
             scale=case.scale,
         )
 
+    def sparse_na_bilinear(
+        query_arg: torch.Tensor,
+        key_arg: torch.Tensor,
+        value_arg: torch.Tensor,
+        coords_arg: torch.Tensor,
+    ) -> torch.Tensor:
+        return natten_sparse_na2d_bilinear(
+            query_arg,
+            key_arg,
+            value_arg,
+            coords_arg,
+            kernel_size=case.kernel_size,
+            scale=case.scale,
+        )
+
     dense_fn = lambda: dense_na(query, key, value)
     dense_checkpointed_fn = lambda: run_checkpointed(dense_na, query, key, value, use_reentrant=use_reentrant)
     sparse_fn = lambda: sparse_na(sparse_query, key, value, coords)
@@ -297,6 +313,15 @@ def benchmark_case(
         coords,
         use_reentrant=use_reentrant,
     )
+    sparse_bilinear_fn = lambda: sparse_na_bilinear(sparse_query, key, value, coords)
+    sparse_bilinear_checkpointed_fn = lambda: run_checkpointed(
+        sparse_na_bilinear,
+        sparse_query,
+        key,
+        value,
+        coords,
+        use_reentrant=use_reentrant,
+    )
 
     dense_fwd, dense_fwd_ckpt = benchmark_forward(dense_fn, dense_checkpointed_fn, warmup, iters)
     dense_bwd, dense_bwd_ckpt = benchmark_backward(
@@ -309,7 +334,7 @@ def benchmark_case(
     )
     sparse_fwd, sparse_fwd_ckpt = benchmark_forward(sparse_fn, sparse_checkpointed_fn, warmup, iters)
     sparse_bwd, sparse_bwd_ckpt = benchmark_backward(
-        (query, key, value),
+        (sparse_query, key, value),
         sparse_grad,
         sparse_fn,
         sparse_checkpointed_fn,
@@ -323,10 +348,24 @@ def benchmark_case(
         iters,
     )
     sparse_simple_bwd, sparse_simple_bwd_ckpt = benchmark_backward(
-        (query, key, value),
+        (sparse_query, key, value),
         sparse_grad,
         sparse_simple_fn,
         sparse_simple_checkpointed_fn,
+        warmup,
+        iters,
+    )
+    sparse_bilinear_fwd, sparse_bilinear_fwd_ckpt = benchmark_forward(
+        sparse_bilinear_fn,
+        sparse_bilinear_checkpointed_fn,
+        warmup,
+        iters,
+    )
+    sparse_bilinear_bwd, sparse_bilinear_bwd_ckpt = benchmark_backward(
+        (sparse_query, key, value),
+        sparse_grad,
+        sparse_bilinear_fn,
+        sparse_bilinear_checkpointed_fn,
         warmup,
         iters,
     )
@@ -346,6 +385,8 @@ def benchmark_case(
     print(f"natten_sparse_na2d ckpt              {sparse_fwd_ckpt[0]:8.3f} +/- {sparse_fwd_ckpt[1]:6.3f}  {sparse_bwd_ckpt[0]:8.3f} +/- {sparse_bwd_ckpt[1]:6.3f}")
     print(f"natten_sparse_na2d_simple            {sparse_simple_fwd[0]:8.3f} +/- {sparse_simple_fwd[1]:6.3f}  {sparse_simple_bwd[0]:8.3f} +/- {sparse_simple_bwd[1]:6.3f}")
     print(f"natten_sparse_na2d_simple ckpt       {sparse_simple_fwd_ckpt[0]:8.3f} +/- {sparse_simple_fwd_ckpt[1]:6.3f}  {sparse_simple_bwd_ckpt[0]:8.3f} +/- {sparse_simple_bwd_ckpt[1]:6.3f}")
+    print(f"natten_sparse_na2d_bilinear          {sparse_bilinear_fwd[0]:8.3f} +/- {sparse_bilinear_fwd[1]:6.3f}  {sparse_bilinear_bwd[0]:8.3f} +/- {sparse_bilinear_bwd[1]:6.3f}")
+    print(f"natten_sparse_na2d_bilinear ckpt     {sparse_bilinear_fwd_ckpt[0]:8.3f} +/- {sparse_bilinear_fwd_ckpt[1]:6.3f}  {sparse_bilinear_bwd_ckpt[0]:8.3f} +/- {sparse_bilinear_bwd_ckpt[1]:6.3f}")
 
     del query, sparse_query, key, value, coords, dense_grad, sparse_grad
     gc.collect()

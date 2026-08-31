@@ -26,10 +26,12 @@
 #include <ATen/cuda/Atomic.cuh>
 #include <ATen/native/cuda/KernelUtils.cuh>
 #include <c10/cuda/CUDAGuard.h>
+#include <cuda_fp16.h>
 #include <torch/extension.h>
 
 #include <cmath>
 #include <limits>
+#include <type_traits>
 
 #include <natten/helpers.h>
 #include <natten/fna.h>
@@ -907,6 +909,706 @@ __global__ void sparse_na2d_simple_backward_kernel(
   }
 }
 
+template <typename coord_t>
+__device__ inline void init_bilinear_neighborhood(
+    const coord_t* __restrict__ coord_ptr,
+    int height,
+    int width,
+    int kernel_h,
+    int kernel_w,
+    int* __restrict__ y0s,
+    int* __restrict__ y1s,
+    int* __restrict__ x0s,
+    int* __restrict__ x1s,
+    float* __restrict__ w00s,
+    float* __restrict__ w01s,
+    float* __restrict__ w10s,
+    float* __restrict__ w11s) {
+  float center_yf = coord_to_position(coord_ptr[0], height);
+  float center_xf = coord_to_position(coord_ptr[1], width);
+  int k_tokens = kernel_h * kernel_w;
+
+  for (int offset_idx = threadIdx.x; offset_idx < k_tokens; offset_idx += blockDim.x) {
+    int oy = (offset_idx / kernel_w) - (kernel_h / 2);
+    int ox = (offset_idx % kernel_w) - (kernel_w / 2);
+    float yf = fminf(fmaxf(center_yf + static_cast<float>(oy), 0.0f), static_cast<float>(height - 1));
+    float xf = fminf(fmaxf(center_xf + static_cast<float>(ox), 0.0f), static_cast<float>(width - 1));
+    int y0, y1, x0, x1;
+    float wy0, wy1, wx0, wx1;
+    bilinear_indices_and_weights(yf, xf, height, width, y0, y1, x0, x1, wy0, wy1, wx0, wx1);
+    y0s[offset_idx] = y0;
+    y1s[offset_idx] = y1;
+    x0s[offset_idx] = x0;
+    x1s[offset_idx] = x1;
+    w00s[offset_idx] = wy0 * wx0;
+    w01s[offset_idx] = wy0 * wx1;
+    w10s[offset_idx] = wy1 * wx0;
+    w11s[offset_idx] = wy1 * wx1;
+  }
+}
+
+template <typename scalar_t>
+__device__ inline float bilinear_cached_load(
+    const scalar_t* __restrict__ tensor,
+    int batch_idx,
+    int height,
+    int width,
+    int heads,
+    int head_idx,
+    int dim,
+    int channel,
+    int y0,
+    int y1,
+    int x0,
+    int x1,
+    float w00,
+    float w01,
+    float w10,
+    float w11) {
+  int base00 = ((((batch_idx * height + y0) * width + x0) * heads + head_idx) * dim) + channel;
+  int base01 = ((((batch_idx * height + y0) * width + x1) * heads + head_idx) * dim) + channel;
+  int base10 = ((((batch_idx * height + y1) * width + x0) * heads + head_idx) * dim) + channel;
+  int base11 = ((((batch_idx * height + y1) * width + x1) * heads + head_idx) * dim) + channel;
+  return w00 * load_as_float(tensor + base00) +
+      w01 * load_as_float(tensor + base01) +
+      w10 * load_as_float(tensor + base10) +
+      w11 * load_as_float(tensor + base11);
+}
+
+template <typename scalar_t>
+__device__ inline float bilinear_cached_dot(
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ key,
+    int batch_idx,
+    int height,
+    int width,
+    int heads,
+    int head_idx,
+    int dim,
+    int y0,
+    int y1,
+    int x0,
+    int x1,
+    float w00,
+    float w01,
+    float w10,
+    float w11) {
+  float acc = 0.0f;
+
+  if constexpr (std::is_same_v<scalar_t, at::Half>) {
+    if ((dim & 1) == 0) {
+      const __half2* q2 = reinterpret_cast<const __half2*>(query);
+      const __half2* k00 = reinterpret_cast<const __half2*>(
+          key + ((((batch_idx * height + y0) * width + x0) * heads + head_idx) * dim));
+      const __half2* k01 = reinterpret_cast<const __half2*>(
+          key + ((((batch_idx * height + y0) * width + x1) * heads + head_idx) * dim));
+      const __half2* k10 = reinterpret_cast<const __half2*>(
+          key + ((((batch_idx * height + y1) * width + x0) * heads + head_idx) * dim));
+      const __half2* k11 = reinterpret_cast<const __half2*>(
+          key + ((((batch_idx * height + y1) * width + x1) * heads + head_idx) * dim));
+      for (int d = 0; d < dim / 2; ++d) {
+        float2 qv = __half22float2(q2[d]);
+        float2 v00 = __half22float2(k00[d]);
+        float2 v01 = __half22float2(k01[d]);
+        float2 v10 = __half22float2(k10[d]);
+        float2 v11 = __half22float2(k11[d]);
+        float kx = w00 * v00.x + w01 * v01.x + w10 * v10.x + w11 * v11.x;
+        float ky = w00 * v00.y + w01 * v01.y + w10 * v10.y + w11 * v11.y;
+        acc += qv.x * kx + qv.y * ky;
+      }
+      return acc;
+    }
+  }
+
+  for (int d = 0; d < dim; ++d) {
+    acc += load_as_float(query + d) *
+        bilinear_cached_load(
+               key,
+               batch_idx,
+               height,
+               width,
+               heads,
+               head_idx,
+               dim,
+               d,
+               y0,
+               y1,
+               x0,
+               x1,
+               w00,
+               w01,
+               w10,
+               w11);
+  }
+  return acc;
+}
+
+template <typename scalar_t>
+__device__ inline void bilinear_cached_atomic_add(
+    scalar_t* __restrict__ grad,
+    int batch_idx,
+    int height,
+    int width,
+    int heads,
+    int head_idx,
+    int dim,
+    int channel,
+    int y0,
+    int y1,
+    int x0,
+    int x1,
+    float w00,
+    float w01,
+    float w10,
+    float w11,
+    float grad_value,
+    int numel) {
+  int idx00 = ((((batch_idx * height + y0) * width + x0) * heads + head_idx) * dim) + channel;
+  int idx01 = ((((batch_idx * height + y0) * width + x1) * heads + head_idx) * dim) + channel;
+  int idx10 = ((((batch_idx * height + y1) * width + x0) * heads + head_idx) * dim) + channel;
+  int idx11 = ((((batch_idx * height + y1) * width + x1) * heads + head_idx) * dim) + channel;
+  at::native::fastAtomicAdd(grad, idx00, numel, static_cast<scalar_t>(w00 * grad_value), true);
+  at::native::fastAtomicAdd(grad, idx01, numel, static_cast<scalar_t>(w01 * grad_value), true);
+  at::native::fastAtomicAdd(grad, idx10, numel, static_cast<scalar_t>(w10 * grad_value), true);
+  at::native::fastAtomicAdd(grad, idx11, numel, static_cast<scalar_t>(w11 * grad_value), true);
+}
+
+template <typename scalar_t, typename coord_t>
+__global__ void sparse_na2d_bilinear_forward_kernel(
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    const coord_t* __restrict__ coords,
+    scalar_t* __restrict__ out,
+    float* __restrict__ logsumexp,
+    int batch,
+    int num_queries,
+    int height,
+    int width,
+    int heads,
+    int dim,
+    int dim_value,
+    int kernel_h,
+    int kernel_w,
+    float scale) {
+  extern __shared__ float smem[];
+  int k_tokens = kernel_h * kernel_w;
+  float* probs = smem;
+  float* w00s = probs + k_tokens;
+  float* w01s = w00s + k_tokens;
+  float* w10s = w01s + k_tokens;
+  float* w11s = w10s + k_tokens;
+  int* y0s = reinterpret_cast<int*>(w11s + k_tokens);
+  int* y1s = y0s + k_tokens;
+  int* x0s = y1s + k_tokens;
+  int* x1s = x0s + k_tokens;
+
+  int query_idx = blockIdx.x;
+  int head_idx = blockIdx.y;
+  int batch_idx = blockIdx.z;
+
+  const scalar_t* q_ptr =
+      query + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim);
+  const coord_t* coord_ptr = coords + ((batch_idx * num_queries + query_idx) * 2);
+  init_bilinear_neighborhood(coord_ptr, height, width, kernel_h, kernel_w, y0s, y1s, x0s, x1s, w00s, w01s, w10s, w11s);
+  __syncthreads();
+
+  for (int offset_idx = threadIdx.x; offset_idx < k_tokens; offset_idx += blockDim.x) {
+    float logit = bilinear_cached_dot(
+        q_ptr,
+        key,
+        batch_idx,
+        height,
+        width,
+        heads,
+        head_idx,
+        dim,
+        y0s[offset_idx],
+        y1s[offset_idx],
+        x0s[offset_idx],
+        x1s[offset_idx],
+        w00s[offset_idx],
+        w01s[offset_idx],
+        w10s[offset_idx],
+        w11s[offset_idx]);
+    probs[offset_idx] = logit * scale;
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    float max_logit = -INFINITY;
+    for (int i = 0; i < k_tokens; ++i) {
+      max_logit = fmaxf(max_logit, probs[i]);
+    }
+    float denom = 0.0f;
+    for (int i = 0; i < k_tokens; ++i) {
+      float p = expf(probs[i] - max_logit);
+      probs[i] = p;
+      denom += p;
+    }
+    float inv_denom = 1.0f / denom;
+    for (int i = 0; i < k_tokens; ++i) {
+      probs[i] *= inv_denom;
+    }
+    logsumexp[(batch_idx * num_queries + query_idx) * heads + head_idx] =
+        logf(denom) + max_logit;
+  }
+  __syncthreads();
+
+  scalar_t* out_ptr =
+      out + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim_value);
+  for (int dv = threadIdx.x; dv < dim_value; dv += blockDim.x) {
+    float acc = 0.0f;
+    for (int offset_idx = 0; offset_idx < k_tokens; ++offset_idx) {
+      acc += probs[offset_idx] *
+          bilinear_cached_load(
+                 value,
+                 batch_idx,
+                 height,
+                 width,
+                 heads,
+                 head_idx,
+                 dim_value,
+                 dv,
+                 y0s[offset_idx],
+                 y1s[offset_idx],
+                 x0s[offset_idx],
+                 x1s[offset_idx],
+                 w00s[offset_idx],
+                 w01s[offset_idx],
+                 w10s[offset_idx],
+                 w11s[offset_idx]);
+    }
+    out_ptr[dv] = static_cast<scalar_t>(acc);
+  }
+}
+
+template <typename scalar_t, typename coord_t>
+__global__ void sparse_na2d_bilinear_backward_kernel(
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    const coord_t* __restrict__ coords,
+    const scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ grad_out,
+    const float* __restrict__ logsumexp,
+    scalar_t* __restrict__ grad_query,
+    scalar_t* __restrict__ grad_key,
+    scalar_t* __restrict__ grad_value,
+    int batch,
+    int num_queries,
+    int height,
+    int width,
+    int heads,
+    int dim,
+    int dim_value,
+    int kernel_h,
+    int kernel_w,
+    float scale) {
+  extern __shared__ float smem[];
+  int k_tokens = kernel_h * kernel_w;
+  float* probs = smem;
+  float* dp = probs + k_tokens;
+  float* reductions = dp + k_tokens;
+  float* w00s = reductions + blockDim.x;
+  float* w01s = w00s + k_tokens;
+  float* w10s = w01s + k_tokens;
+  float* w11s = w10s + k_tokens;
+  int* y0s = reinterpret_cast<int*>(w11s + k_tokens);
+  int* y1s = y0s + k_tokens;
+  int* x0s = y1s + k_tokens;
+  int* x1s = x0s + k_tokens;
+
+  int query_idx = blockIdx.x;
+  int head_idx = blockIdx.y;
+  int batch_idx = blockIdx.z;
+
+  const scalar_t* q_ptr =
+      query + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim);
+  const scalar_t* o_ptr =
+      out + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim_value);
+  const scalar_t* go_ptr =
+      grad_out + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim_value);
+  const coord_t* coord_ptr = coords + ((batch_idx * num_queries + query_idx) * 2);
+  float lse = logsumexp[(batch_idx * num_queries + query_idx) * heads + head_idx];
+
+  init_bilinear_neighborhood(coord_ptr, height, width, kernel_h, kernel_w, y0s, y1s, x0s, x1s, w00s, w01s, w10s, w11s);
+  __syncthreads();
+
+  for (int offset_idx = threadIdx.x; offset_idx < k_tokens; offset_idx += blockDim.x) {
+    float logit = bilinear_cached_dot(
+        q_ptr,
+        key,
+        batch_idx,
+        height,
+        width,
+        heads,
+        head_idx,
+        dim,
+        y0s[offset_idx],
+        y1s[offset_idx],
+        x0s[offset_idx],
+        x1s[offset_idx],
+        w00s[offset_idx],
+        w01s[offset_idx],
+        w10s[offset_idx],
+        w11s[offset_idx]);
+    probs[offset_idx] = expf(logit * scale - lse);
+    dp[offset_idx] = 0.0f;
+  }
+  __syncthreads();
+
+  float delta_part = 0.0f;
+  for (int dv = threadIdx.x; dv < dim_value; dv += blockDim.x) {
+    delta_part += load_as_float(go_ptr + dv) * load_as_float(o_ptr + dv);
+  }
+  reductions[threadIdx.x] = delta_part;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reductions[threadIdx.x] += reductions[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  float delta = reductions[0];
+
+  for (int offset_idx = 0; offset_idx < k_tokens; ++offset_idx) {
+    float dp_part = 0.0f;
+    for (int dv = threadIdx.x; dv < dim_value; dv += blockDim.x) {
+      float vval = bilinear_cached_load(
+          value,
+          batch_idx,
+          height,
+          width,
+          heads,
+          head_idx,
+          dim_value,
+          dv,
+          y0s[offset_idx],
+          y1s[offset_idx],
+          x0s[offset_idx],
+          x1s[offset_idx],
+          w00s[offset_idx],
+          w01s[offset_idx],
+          w10s[offset_idx],
+          w11s[offset_idx]);
+      dp_part += load_as_float(go_ptr + dv) * vval;
+      float gv = probs[offset_idx] * load_as_float(go_ptr + dv);
+      bilinear_cached_atomic_add(
+          grad_value,
+          batch_idx,
+          height,
+          width,
+          heads,
+          head_idx,
+          dim_value,
+          dv,
+          y0s[offset_idx],
+          y1s[offset_idx],
+          x0s[offset_idx],
+          x1s[offset_idx],
+          w00s[offset_idx],
+          w01s[offset_idx],
+          w10s[offset_idx],
+          w11s[offset_idx],
+          gv,
+          batch * height * width * heads * dim_value);
+    }
+    reductions[threadIdx.x] = dp_part;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        reductions[threadIdx.x] += reductions[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      dp[offset_idx] = probs[offset_idx] * (reductions[0] - delta) * scale;
+    }
+    __syncthreads();
+  }
+
+  scalar_t* gq_ptr =
+      grad_query + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim);
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int offset_idx = 0; offset_idx < k_tokens; ++offset_idx) {
+      float kval = bilinear_cached_load(
+          key,
+          batch_idx,
+          height,
+          width,
+          heads,
+          head_idx,
+          dim,
+          d,
+          y0s[offset_idx],
+          y1s[offset_idx],
+          x0s[offset_idx],
+          x1s[offset_idx],
+          w00s[offset_idx],
+          w01s[offset_idx],
+          w10s[offset_idx],
+          w11s[offset_idx]);
+      acc += dp[offset_idx] * kval;
+      float gk = dp[offset_idx] * load_as_float(q_ptr + d);
+      bilinear_cached_atomic_add(
+          grad_key,
+          batch_idx,
+          height,
+          width,
+          heads,
+          head_idx,
+          dim,
+          d,
+          y0s[offset_idx],
+          y1s[offset_idx],
+          x0s[offset_idx],
+          x1s[offset_idx],
+          w00s[offset_idx],
+          w01s[offset_idx],
+          w10s[offset_idx],
+          w11s[offset_idx],
+          gk,
+          batch * height * width * heads * dim);
+    }
+    gq_ptr[d] = static_cast<scalar_t>(acc);
+  }
+}
+
+template <typename scalar_t, typename coord_t>
+__global__ void sparse_na2d_bilinear_backward_value_dp_kernel(
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    const coord_t* __restrict__ coords,
+    const scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ grad_out,
+    const float* __restrict__ logsumexp,
+    float* __restrict__ dp_global,
+    scalar_t* __restrict__ grad_value,
+    int batch,
+    int num_queries,
+    int height,
+    int width,
+    int heads,
+    int dim,
+    int dim_value,
+    int kernel_h,
+    int kernel_w,
+    float scale) {
+  extern __shared__ float smem[];
+  int k_tokens = kernel_h * kernel_w;
+  float* probs = smem;
+  float* reductions = probs + k_tokens;
+  float* w00s = reductions + blockDim.x;
+  float* w01s = w00s + k_tokens;
+  float* w10s = w01s + k_tokens;
+  float* w11s = w10s + k_tokens;
+  int* y0s = reinterpret_cast<int*>(w11s + k_tokens);
+  int* y1s = y0s + k_tokens;
+  int* x0s = y1s + k_tokens;
+  int* x1s = x0s + k_tokens;
+
+  int query_idx = blockIdx.x;
+  int head_idx = blockIdx.y;
+  int batch_idx = blockIdx.z;
+
+  const scalar_t* q_ptr =
+      query + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim);
+  const scalar_t* o_ptr =
+      out + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim_value);
+  const scalar_t* go_ptr =
+      grad_out + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim_value);
+  const coord_t* coord_ptr = coords + ((batch_idx * num_queries + query_idx) * 2);
+  float* dp_ptr = dp_global + (((batch_idx * num_queries + query_idx) * heads + head_idx) * k_tokens);
+  float lse = logsumexp[(batch_idx * num_queries + query_idx) * heads + head_idx];
+
+  init_bilinear_neighborhood(coord_ptr, height, width, kernel_h, kernel_w, y0s, y1s, x0s, x1s, w00s, w01s, w10s, w11s);
+  __syncthreads();
+
+  for (int offset_idx = threadIdx.x; offset_idx < k_tokens; offset_idx += blockDim.x) {
+    float logit = bilinear_cached_dot(
+        q_ptr,
+        key,
+        batch_idx,
+        height,
+        width,
+        heads,
+        head_idx,
+        dim,
+        y0s[offset_idx],
+        y1s[offset_idx],
+        x0s[offset_idx],
+        x1s[offset_idx],
+        w00s[offset_idx],
+        w01s[offset_idx],
+        w10s[offset_idx],
+        w11s[offset_idx]);
+    probs[offset_idx] = expf(logit * scale - lse);
+  }
+  __syncthreads();
+
+  float delta_part = 0.0f;
+  for (int dv = threadIdx.x; dv < dim_value; dv += blockDim.x) {
+    delta_part += load_as_float(go_ptr + dv) * load_as_float(o_ptr + dv);
+  }
+  reductions[threadIdx.x] = delta_part;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reductions[threadIdx.x] += reductions[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  float delta = reductions[0];
+
+  for (int offset_idx = 0; offset_idx < k_tokens; ++offset_idx) {
+    float dp_part = 0.0f;
+    for (int dv = threadIdx.x; dv < dim_value; dv += blockDim.x) {
+      float vval = bilinear_cached_load(
+          value,
+          batch_idx,
+          height,
+          width,
+          heads,
+          head_idx,
+          dim_value,
+          dv,
+          y0s[offset_idx],
+          y1s[offset_idx],
+          x0s[offset_idx],
+          x1s[offset_idx],
+          w00s[offset_idx],
+          w01s[offset_idx],
+          w10s[offset_idx],
+          w11s[offset_idx]);
+      float go = load_as_float(go_ptr + dv);
+      dp_part += go * vval;
+      bilinear_cached_atomic_add(
+          grad_value,
+          batch_idx,
+          height,
+          width,
+          heads,
+          head_idx,
+          dim_value,
+          dv,
+          y0s[offset_idx],
+          y1s[offset_idx],
+          x0s[offset_idx],
+          x1s[offset_idx],
+          w00s[offset_idx],
+          w01s[offset_idx],
+          w10s[offset_idx],
+          w11s[offset_idx],
+          probs[offset_idx] * go,
+          batch * height * width * heads * dim_value);
+    }
+    reductions[threadIdx.x] = dp_part;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        reductions[threadIdx.x] += reductions[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      dp_ptr[offset_idx] = probs[offset_idx] * (reductions[0] - delta) * scale;
+    }
+    __syncthreads();
+  }
+}
+
+template <typename scalar_t, typename coord_t>
+__global__ void sparse_na2d_bilinear_backward_query_key_kernel(
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ key,
+    const coord_t* __restrict__ coords,
+    const float* __restrict__ dp_global,
+    scalar_t* __restrict__ grad_query,
+    scalar_t* __restrict__ grad_key,
+    int batch,
+    int num_queries,
+    int height,
+    int width,
+    int heads,
+    int dim,
+    int kernel_h,
+    int kernel_w) {
+  extern __shared__ float smem[];
+  int k_tokens = kernel_h * kernel_w;
+  float* w00s = smem;
+  float* w01s = w00s + k_tokens;
+  float* w10s = w01s + k_tokens;
+  float* w11s = w10s + k_tokens;
+  int* y0s = reinterpret_cast<int*>(w11s + k_tokens);
+  int* y1s = y0s + k_tokens;
+  int* x0s = y1s + k_tokens;
+  int* x1s = x0s + k_tokens;
+
+  int query_idx = blockIdx.x;
+  int head_idx = blockIdx.y;
+  int batch_idx = blockIdx.z;
+
+  const scalar_t* q_ptr =
+      query + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim);
+  scalar_t* gq_ptr =
+      grad_query + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim);
+  const coord_t* coord_ptr = coords + ((batch_idx * num_queries + query_idx) * 2);
+  const float* dp_ptr = dp_global + (((batch_idx * num_queries + query_idx) * heads + head_idx) * k_tokens);
+
+  init_bilinear_neighborhood(coord_ptr, height, width, kernel_h, kernel_w, y0s, y1s, x0s, x1s, w00s, w01s, w10s, w11s);
+  __syncthreads();
+
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int offset_idx = 0; offset_idx < k_tokens; ++offset_idx) {
+      float dp = dp_ptr[offset_idx];
+      float kval = bilinear_cached_load(
+          key,
+          batch_idx,
+          height,
+          width,
+          heads,
+          head_idx,
+          dim,
+          d,
+          y0s[offset_idx],
+          y1s[offset_idx],
+          x0s[offset_idx],
+          x1s[offset_idx],
+          w00s[offset_idx],
+          w01s[offset_idx],
+          w10s[offset_idx],
+          w11s[offset_idx]);
+      acc += dp * kval;
+      bilinear_cached_atomic_add(
+          grad_key,
+          batch_idx,
+          height,
+          width,
+          heads,
+          head_idx,
+          dim,
+          d,
+          y0s[offset_idx],
+          y1s[offset_idx],
+          x0s[offset_idx],
+          x1s[offset_idx],
+          w00s[offset_idx],
+          w01s[offset_idx],
+          w10s[offset_idx],
+          w11s[offset_idx],
+          dp * load_as_float(q_ptr + d),
+          batch * height * width * heads * dim);
+    }
+    gq_ptr[d] = static_cast<scalar_t>(acc);
+  }
+}
+
 void check_sparse_na2d_args(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -1072,6 +1774,73 @@ void sparse_na2d_simple_forward(
             [&] {
               using coord_scalar_t = scalar_t;
               sparse_na2d_simple_forward_kernel<q_scalar_t, coord_scalar_t>
+                  <<<grid, kSimpleThreads, smem_bytes, stream>>>(
+                      query.data_ptr<q_scalar_t>(),
+                      key.data_ptr<q_scalar_t>(),
+                      value.data_ptr<q_scalar_t>(),
+                      coords.data_ptr<coord_scalar_t>(),
+                      out.data_ptr<q_scalar_t>(),
+                      logsumexp.data_ptr<float>(),
+                      batch,
+                      num_queries,
+                      height,
+                      width,
+                      heads,
+                      dim,
+                      dim_value,
+                      kernel_h,
+                      kernel_w,
+                      attn_scale);
+            });
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void sparse_na2d_bilinear_forward(
+    at::Tensor& out,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& coords,
+    at::Tensor& logsumexp,
+    const std::tuple<int32_t, int32_t>& kernel_size,
+    float attn_scale) {
+  check_sparse_na2d_args(query, key, value, coords, kernel_size);
+  CHECK_CONTIGUOUS(out);
+  CHECK_CONTIGUOUS(logsumexp);
+  CHECK_CUDA(out);
+  CHECK_CUDA(logsumexp);
+
+  at::cuda::OptionalCUDAGuard device_guard(query.device());
+  const int batch = query.size(0);
+  const int num_queries = query.size(1);
+  const int height = key.size(1);
+  const int width = key.size(2);
+  const int heads = query.size(2);
+  const int dim = query.size(3);
+  const int dim_value = value.size(4);
+  const int kernel_h = std::get<0>(kernel_size);
+  const int kernel_w = std::get<1>(kernel_size);
+
+  dim3 grid(num_queries, heads, batch);
+  size_t smem_bytes = 5 * kernel_h * kernel_w * sizeof(float) +
+      4 * kernel_h * kernel_w * sizeof(int);
+  auto stream = at::cuda::getCurrentCUDAStream(query.device().index());
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      query.scalar_type(),
+      "sparse_na2d_bilinear_forward",
+      [&] {
+        using q_scalar_t = scalar_t;
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half,
+            at::ScalarType::BFloat16,
+            coords.scalar_type(),
+            "sparse_na2d_bilinear_forward_coords",
+            [&] {
+              using coord_scalar_t = scalar_t;
+              sparse_na2d_bilinear_forward_kernel<q_scalar_t, coord_scalar_t>
                   <<<grid, kSimpleThreads, smem_bytes, stream>>>(
                       query.data_ptr<q_scalar_t>(),
                       key.data_ptr<q_scalar_t>(),
@@ -1268,6 +2037,111 @@ void sparse_na2d_simple_backward(
                       kernel_h,
                       kernel_w,
                       attn_scale);
+            });
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void sparse_na2d_bilinear_backward(
+    at::Tensor& grad_query,
+    at::Tensor& grad_key,
+    at::Tensor& grad_value,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& coords,
+    const at::Tensor& out,
+    const at::Tensor& grad_out,
+    const at::Tensor& logsumexp,
+    const std::tuple<int32_t, int32_t>& kernel_size,
+    float attn_scale) {
+  check_sparse_na2d_args(query, key, value, coords, kernel_size);
+  CHECK_CONTIGUOUS(grad_query);
+  CHECK_CONTIGUOUS(grad_key);
+  CHECK_CONTIGUOUS(grad_value);
+  CHECK_CONTIGUOUS(out);
+  CHECK_CONTIGUOUS(grad_out);
+  CHECK_CONTIGUOUS(logsumexp);
+  CHECK_CUDA(grad_query);
+  CHECK_CUDA(grad_key);
+  CHECK_CUDA(grad_value);
+  CHECK_CUDA(out);
+  CHECK_CUDA(grad_out);
+  CHECK_CUDA(logsumexp);
+
+  grad_key.zero_();
+  grad_value.zero_();
+
+  at::cuda::OptionalCUDAGuard device_guard(query.device());
+  const int batch = query.size(0);
+  const int num_queries = query.size(1);
+  const int height = key.size(1);
+  const int width = key.size(2);
+  const int heads = query.size(2);
+  const int dim = query.size(3);
+  const int dim_value = value.size(4);
+  const int kernel_h = std::get<0>(kernel_size);
+  const int kernel_w = std::get<1>(kernel_size);
+  const int k_tokens = kernel_h * kernel_w;
+
+  dim3 grid(num_queries, heads, batch);
+  at::Tensor dp = at::empty({batch, num_queries, heads, k_tokens}, query.options().dtype(at::kFloat));
+  size_t value_dp_smem_bytes = (5 * k_tokens + kSimpleThreads) * sizeof(float) +
+      4 * k_tokens * sizeof(int);
+  size_t query_key_smem_bytes = 4 * k_tokens * sizeof(float) +
+      4 * k_tokens * sizeof(int);
+  auto stream = at::cuda::getCurrentCUDAStream(query.device().index());
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      query.scalar_type(),
+      "sparse_na2d_bilinear_backward",
+      [&] {
+        using q_scalar_t = scalar_t;
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half,
+            at::ScalarType::BFloat16,
+            coords.scalar_type(),
+            "sparse_na2d_bilinear_backward_coords",
+            [&] {
+              using coord_scalar_t = scalar_t;
+              sparse_na2d_bilinear_backward_value_dp_kernel<q_scalar_t, coord_scalar_t>
+                  <<<grid, kSimpleThreads, value_dp_smem_bytes, stream>>>(
+                      query.data_ptr<q_scalar_t>(),
+                      key.data_ptr<q_scalar_t>(),
+                      value.data_ptr<q_scalar_t>(),
+                      coords.data_ptr<coord_scalar_t>(),
+                      out.data_ptr<q_scalar_t>(),
+                      grad_out.data_ptr<q_scalar_t>(),
+                      logsumexp.data_ptr<float>(),
+                      dp.data_ptr<float>(),
+                      grad_value.data_ptr<q_scalar_t>(),
+                      batch,
+                      num_queries,
+                      height,
+                      width,
+                      heads,
+                      dim,
+                      dim_value,
+                      kernel_h,
+                      kernel_w,
+                      attn_scale);
+              sparse_na2d_bilinear_backward_query_key_kernel<q_scalar_t, coord_scalar_t>
+                  <<<grid, kSimpleThreads, query_key_smem_bytes, stream>>>(
+                      query.data_ptr<q_scalar_t>(),
+                      key.data_ptr<q_scalar_t>(),
+                      coords.data_ptr<coord_scalar_t>(),
+                      dp.data_ptr<float>(),
+                      grad_query.data_ptr<q_scalar_t>(),
+                      grad_key.data_ptr<q_scalar_t>(),
+                      batch,
+                      num_queries,
+                      height,
+                      width,
+                      heads,
+                      dim,
+                      kernel_h,
+                      kernel_w);
             });
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
