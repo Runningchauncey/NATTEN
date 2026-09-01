@@ -64,6 +64,7 @@ from natten.functional import (
     sparse_na2d,
     sparse_na2d_bilinear,
     sparse_na2d_simple,
+    sparse_na2d_sparse_kernel,
 )
 from natten.modules import (
     NeighborhoodAttention1D,
@@ -113,6 +114,7 @@ __all__ = [
     "sparse_na2d",
     "sparse_na2d_bilinear",
     "sparse_na2d_simple",
+    "sparse_na2d_sparse_kernel",
     "attention",
     "merge_attentions",
 ]

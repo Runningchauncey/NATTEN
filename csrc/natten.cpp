@@ -146,6 +146,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "sparse_na2d_bilinear_backward", &natten::sparse_na2d_bilinear_backward, "Bilinear sparse coordinate NA2D backward");
 
+  m.def(
+      "sparse_na2d_sparse_kernel_forward",
+      &natten::sparse_na2d_sparse_kernel_forward,
+      "Predefined indexed sparse key-neighborhood NA2D forward");
+
+  m.def(
+      "sparse_na2d_sparse_kernel_backward",
+      &natten::sparse_na2d_sparse_kernel_backward,
+      "Predefined indexed sparse key-neighborhood NA2D backward");
+
   ////// SM50/SM70/SM75/SM80 - FMHA
   m.def(
       "fmha_forward", &natten::fmha_forward, "FMHA forward (fused)");

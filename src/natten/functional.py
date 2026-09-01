@@ -35,6 +35,8 @@ from natten._libnatten import (
     sparse_na2d_forward,
     sparse_na2d_simple_backward,
     sparse_na2d_simple_forward,
+    sparse_na2d_sparse_kernel_backward,
+    sparse_na2d_sparse_kernel_forward,
 )
 from natten.backends import (
     choose_backend,
@@ -249,6 +251,54 @@ class SparseNa2dBilinearAutogradFn(Function):
         return grad_query, grad_key, grad_value, None, None, None
 
 
+class SparseNa2dSparseKernelAutogradFn(Function):
+    @staticmethod
+    @amp_fwd
+    def forward(
+        ctx,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        key_indices: Tensor,
+        scale: float,
+    ) -> Tuple[Tensor, Tensor]:
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        key_indices = key_indices.contiguous()
+
+        output, logsumexp = sparse_na2d_sparse_kernel_forward(
+            query,
+            key,
+            value,
+            key_indices,
+            scale,
+        )
+
+        ctx.save_for_backward(query, key, value, key_indices, output, logsumexp)
+        ctx.scale = scale
+        return output, logsumexp
+
+    @staticmethod
+    @amp_bwd
+    def backward(ctx, grad_output: Tensor, grad_lse: Optional[Tensor] = None):
+        del grad_lse
+        query, key, value, key_indices, output, logsumexp = ctx.saved_tensors
+
+        grad_query, grad_key, grad_value = sparse_na2d_sparse_kernel_backward(
+            query,
+            key,
+            value,
+            key_indices,
+            output,
+            grad_output.contiguous(),
+            logsumexp,
+            ctx.scale,
+        )
+
+        return grad_query, grad_key, grad_value, None, None
+
+
 def _check_sparse_na2d_inputs(
     query: Tensor,
     key: Tensor,
@@ -290,6 +340,38 @@ def _check_sparse_na2d_inputs(
     return kernel_size
 
 
+def _check_sparse_na2d_sparse_kernel_inputs(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    key_indices: Tensor,
+) -> None:
+    if query.dim() != 4:
+        raise ValueError(f"query must be [B, N, heads, head_dim], got {query.shape}.")
+    if key.dim() != 5 or value.dim() != 5:
+        raise ValueError(
+            f"key/value must be [B, H, W, heads, dim], got {key.shape=} and {value.shape=}."
+        )
+    if key_indices.dim() != 4 or key_indices.shape[-1] != 2:
+        raise ValueError(f"key_indices must be [B, N, K, 2], got {key_indices.shape}.")
+    if key_indices.shape[2] < 1:
+        raise ValueError("key_indices requires K > 0.")
+    if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
+        raise ValueError("query, key, and value batch sizes must match.")
+    if query.shape[0] != key_indices.shape[0] or query.shape[1] != key_indices.shape[1]:
+        raise ValueError("key_indices must match query batch and sparse query dimensions.")
+    if key.shape[:3] != value.shape[:3]:
+        raise ValueError("key and value map shapes must match in batch, height, and width.")
+    if query.shape[2] != key.shape[3] or query.shape[2] != value.shape[3]:
+        raise ValueError("query, key, and value head counts must match.")
+    if query.shape[3] != key.shape[4]:
+        raise ValueError("query and key head dimensions must match.")
+    if query.dtype != key.dtype or query.dtype != value.dtype:
+        raise ValueError("query, key, and value dtypes must match.")
+    if key_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("key_indices must be int32 or int64.")
+
+
 def sparse_na2d_simple(
     query: Tensor,
     key: Tensor,
@@ -319,6 +401,35 @@ def sparse_na2d_simple(
         value,
         coords,
         kernel_size,
+        scale,
+    )
+
+    if return_lse:
+        return output, lse
+    return output
+
+
+def sparse_na2d_sparse_kernel(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    key_indices: Tensor,
+    scale: Optional[float] = None,
+    return_lse: bool = False,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """Computes sparse-key indexed 2-D neighborhood attention.
+
+    Each sparse query attends to explicit key/value map indices from
+    `key_indices [B, N, K, 2]` in `[y, x]` order. Indices are clamped in the
+    CUDA kernel, and gradients are not computed with respect to `key_indices`.
+    """
+    _check_sparse_na2d_sparse_kernel_inputs(query, key, value, key_indices)
+    scale = scale or query.shape[-1] ** -0.5
+    output, lse = SparseNa2dSparseKernelAutogradFn.apply(
+        query,
+        key,
+        value,
+        key_indices,
         scale,
     )
 

@@ -909,6 +909,265 @@ __global__ void sparse_na2d_simple_backward_kernel(
   }
 }
 
+template <typename index_t>
+__device__ inline int load_clamped_index(
+    const index_t* __restrict__ key_indices,
+    int offset_idx,
+    int coord_idx,
+    int extent) {
+  int idx = static_cast<int>(key_indices[offset_idx * 2 + coord_idx]);
+  return max(0, min(idx, extent - 1));
+}
+
+template <typename scalar_t>
+__device__ inline float indexed_cached_dot(
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ key,
+    int batch_idx,
+    int height,
+    int width,
+    int heads,
+    int head_idx,
+    int dim,
+    int y,
+    int x) {
+  float acc = 0.0f;
+
+  if constexpr (std::is_same_v<scalar_t, at::Half>) {
+    if ((dim & 1) == 0) {
+      const __half2* q2 = reinterpret_cast<const __half2*>(query);
+      const __half2* k2 = reinterpret_cast<const __half2*>(
+          key + ((((batch_idx * height + y) * width + x) * heads + head_idx) * dim));
+      for (int d = 0; d < dim / 2; ++d) {
+        float2 qv = __half22float2(q2[d]);
+        float2 kv = __half22float2(k2[d]);
+        acc += qv.x * kv.x + qv.y * kv.y;
+      }
+      return acc;
+    }
+  }
+
+  const scalar_t* k_ptr =
+      key + ((((batch_idx * height + y) * width + x) * heads + head_idx) * dim);
+  for (int d = 0; d < dim; ++d) {
+    acc += load_as_float(query + d) * load_as_float(k_ptr + d);
+  }
+  return acc;
+}
+
+template <typename scalar_t, typename index_t>
+__global__ void sparse_na2d_sparse_kernel_forward_kernel(
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    const index_t* __restrict__ key_indices,
+    scalar_t* __restrict__ out,
+    float* __restrict__ logsumexp,
+    int batch,
+    int num_queries,
+    int num_keys,
+    int height,
+    int width,
+    int heads,
+    int dim,
+    int dim_value,
+    float scale) {
+  extern __shared__ float smem[];
+  float* probs = smem;
+  int* ys = reinterpret_cast<int*>(probs + num_keys);
+  int* xs = ys + num_keys;
+
+  int query_idx = blockIdx.x;
+  int head_idx = blockIdx.y;
+  int batch_idx = blockIdx.z;
+
+  const scalar_t* q_ptr =
+      query + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim);
+  const index_t* indices_ptr =
+      key_indices + (((batch_idx * num_queries + query_idx) * num_keys) * 2);
+
+  for (int offset_idx = threadIdx.x; offset_idx < num_keys; offset_idx += blockDim.x) {
+    int y = load_clamped_index(indices_ptr, offset_idx, 0, height);
+    int x = load_clamped_index(indices_ptr, offset_idx, 1, width);
+    ys[offset_idx] = y;
+    xs[offset_idx] = x;
+    probs[offset_idx] = indexed_cached_dot(
+        q_ptr,
+        key,
+        batch_idx,
+        height,
+        width,
+        heads,
+        head_idx,
+        dim,
+        y,
+        x) * scale;
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    float max_logit = -INFINITY;
+    for (int i = 0; i < num_keys; ++i) {
+      max_logit = fmaxf(max_logit, probs[i]);
+    }
+    float denom = 0.0f;
+    for (int i = 0; i < num_keys; ++i) {
+      float p = expf(probs[i] - max_logit);
+      probs[i] = p;
+      denom += p;
+    }
+    float inv_denom = 1.0f / denom;
+    for (int i = 0; i < num_keys; ++i) {
+      probs[i] *= inv_denom;
+    }
+    logsumexp[(batch_idx * num_queries + query_idx) * heads + head_idx] =
+        logf(denom) + max_logit;
+  }
+  __syncthreads();
+
+  scalar_t* out_ptr =
+      out + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim_value);
+  for (int dv = threadIdx.x; dv < dim_value; dv += blockDim.x) {
+    float acc = 0.0f;
+    for (int offset_idx = 0; offset_idx < num_keys; ++offset_idx) {
+      const scalar_t* v_ptr =
+          value + ((((batch_idx * height + ys[offset_idx]) * width + xs[offset_idx]) * heads + head_idx) * dim_value);
+      acc += probs[offset_idx] * load_as_float(v_ptr + dv);
+    }
+    out_ptr[dv] = static_cast<scalar_t>(acc);
+  }
+}
+
+template <typename scalar_t, typename index_t>
+__global__ void sparse_na2d_sparse_kernel_backward_kernel(
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    const index_t* __restrict__ key_indices,
+    const scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ grad_out,
+    const float* __restrict__ logsumexp,
+    scalar_t* __restrict__ grad_query,
+    scalar_t* __restrict__ grad_key,
+    scalar_t* __restrict__ grad_value,
+    int batch,
+    int num_queries,
+    int num_keys,
+    int height,
+    int width,
+    int heads,
+    int dim,
+    int dim_value,
+    float scale) {
+  extern __shared__ float smem[];
+  float* probs = smem;
+  float* dp = probs + num_keys;
+  float* reductions = dp + num_keys;
+  int* ys = reinterpret_cast<int*>(reductions + blockDim.x);
+  int* xs = ys + num_keys;
+
+  int query_idx = blockIdx.x;
+  int head_idx = blockIdx.y;
+  int batch_idx = blockIdx.z;
+
+  const scalar_t* q_ptr =
+      query + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim);
+  const scalar_t* o_ptr =
+      out + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim_value);
+  const scalar_t* go_ptr =
+      grad_out + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim_value);
+  const index_t* indices_ptr =
+      key_indices + (((batch_idx * num_queries + query_idx) * num_keys) * 2);
+  float lse = logsumexp[(batch_idx * num_queries + query_idx) * heads + head_idx];
+
+  for (int offset_idx = threadIdx.x; offset_idx < num_keys; offset_idx += blockDim.x) {
+    int y = load_clamped_index(indices_ptr, offset_idx, 0, height);
+    int x = load_clamped_index(indices_ptr, offset_idx, 1, width);
+    ys[offset_idx] = y;
+    xs[offset_idx] = x;
+    float logit = indexed_cached_dot(
+        q_ptr,
+        key,
+        batch_idx,
+        height,
+        width,
+        heads,
+        head_idx,
+        dim,
+        y,
+        x);
+    probs[offset_idx] = expf(logit * scale - lse);
+    dp[offset_idx] = 0.0f;
+  }
+  __syncthreads();
+
+  float delta_part = 0.0f;
+  for (int dv = threadIdx.x; dv < dim_value; dv += blockDim.x) {
+    delta_part += load_as_float(go_ptr + dv) * load_as_float(o_ptr + dv);
+  }
+  reductions[threadIdx.x] = delta_part;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reductions[threadIdx.x] += reductions[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  float delta = reductions[0];
+
+  for (int offset_idx = 0; offset_idx < num_keys; ++offset_idx) {
+    int y = ys[offset_idx];
+    int x = xs[offset_idx];
+    const scalar_t* v_ptr =
+        value + ((((batch_idx * height + y) * width + x) * heads + head_idx) * dim_value);
+
+    float dp_part = 0.0f;
+    for (int dv = threadIdx.x; dv < dim_value; dv += blockDim.x) {
+      float go = load_as_float(go_ptr + dv);
+      dp_part += go * load_as_float(v_ptr + dv);
+      at::native::fastAtomicAdd(
+          grad_value,
+          ((((batch_idx * height + y) * width + x) * heads + head_idx) * dim_value) + dv,
+          batch * height * width * heads * dim_value,
+          static_cast<scalar_t>(probs[offset_idx] * go),
+          true);
+    }
+    reductions[threadIdx.x] = dp_part;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        reductions[threadIdx.x] += reductions[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      dp[offset_idx] = probs[offset_idx] * (reductions[0] - delta) * scale;
+    }
+    __syncthreads();
+  }
+
+  scalar_t* gq_ptr =
+      grad_query + (((batch_idx * num_queries + query_idx) * heads + head_idx) * dim);
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int offset_idx = 0; offset_idx < num_keys; ++offset_idx) {
+      int y = ys[offset_idx];
+      int x = xs[offset_idx];
+      const scalar_t* k_ptr =
+          key + ((((batch_idx * height + y) * width + x) * heads + head_idx) * dim);
+      acc += dp[offset_idx] * load_as_float(k_ptr + d);
+      at::native::fastAtomicAdd(
+          grad_key,
+          ((((batch_idx * height + y) * width + x) * heads + head_idx) * dim) + d,
+          batch * height * width * heads * dim,
+          static_cast<scalar_t>(dp[offset_idx] * load_as_float(q_ptr + d)),
+          true);
+    }
+    gq_ptr[d] = static_cast<scalar_t>(acc);
+  }
+}
+
 template <typename coord_t>
 __device__ inline void init_bilinear_neighborhood(
     const coord_t* __restrict__ coord_ptr,
@@ -1653,6 +1912,47 @@ void check_sparse_na2d_args(
       "sparse_na2d coords must be FP32, FP16, or BF16.");
 }
 
+void check_sparse_na2d_sparse_kernel_args(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& key_indices) {
+  CHECK_CUDA(query);
+  CHECK_CUDA(key);
+  CHECK_CUDA(value);
+  CHECK_CUDA(key_indices);
+  CHECK_CONTIGUOUS(query);
+  CHECK_CONTIGUOUS(key);
+  CHECK_CONTIGUOUS(value);
+  CHECK_CONTIGUOUS(key_indices);
+  TORCH_CHECK(query.dim() == 4, "sparse_na2d_sparse_kernel query must be [B, N, heads, dim].");
+  TORCH_CHECK(key.dim() == 5, "sparse_na2d_sparse_kernel key must be [B, H, W, heads, dim].");
+  TORCH_CHECK(value.dim() == 5, "sparse_na2d_sparse_kernel value must be [B, H, W, heads, dim_value].");
+  TORCH_CHECK(key_indices.dim() == 4, "sparse_na2d_sparse_kernel key_indices must be [B, N, K, 2].");
+  TORCH_CHECK(key_indices.size(3) == 2, "sparse_na2d_sparse_kernel key_indices last dimension must be 2.");
+  TORCH_CHECK(key_indices.size(2) > 0, "sparse_na2d_sparse_kernel requires K > 0.");
+  TORCH_CHECK(query.scalar_type() == key.scalar_type(), "query and key dtypes must match.");
+  TORCH_CHECK(query.scalar_type() == value.scalar_type(), "query and value dtypes must match.");
+  TORCH_CHECK(query.size(0) == key.size(0), "query and key batch sizes must match.");
+  TORCH_CHECK(query.size(0) == value.size(0), "query and value batch sizes must match.");
+  TORCH_CHECK(query.size(0) == key_indices.size(0), "query and key_indices batch sizes must match.");
+  TORCH_CHECK(query.size(1) == key_indices.size(1), "query and key_indices query counts must match.");
+  TORCH_CHECK(key.size(1) == value.size(1), "key/value heights must match.");
+  TORCH_CHECK(key.size(2) == value.size(2), "key/value widths must match.");
+  TORCH_CHECK(query.size(2) == key.size(3), "query/key head counts must match.");
+  TORCH_CHECK(query.size(2) == value.size(3), "query/value head counts must match.");
+  TORCH_CHECK(query.size(3) == key.size(4), "query/key head dimensions must match.");
+  TORCH_CHECK(
+      query.scalar_type() == torch::kFloat16 ||
+          query.scalar_type() == torch::kBFloat16 ||
+          query.scalar_type() == torch::kFloat32,
+      "sparse_na2d_sparse_kernel supports FP32, FP16, and BF16 tensors.");
+  TORCH_CHECK(
+      key_indices.scalar_type() == torch::kInt32 ||
+          key_indices.scalar_type() == torch::kInt64,
+      "sparse_na2d_sparse_kernel key_indices must be int32 or int64.");
+}
+
 } // namespace
 
 void sparse_na2d_forward(
@@ -1859,6 +2159,81 @@ void sparse_na2d_bilinear_forward(
                       kernel_w,
                       attn_scale);
             });
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void sparse_na2d_sparse_kernel_forward(
+    at::Tensor& out,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& key_indices,
+    at::Tensor& logsumexp,
+    float attn_scale) {
+  check_sparse_na2d_sparse_kernel_args(query, key, value, key_indices);
+  CHECK_CONTIGUOUS(out);
+  CHECK_CONTIGUOUS(logsumexp);
+  CHECK_CUDA(out);
+  CHECK_CUDA(logsumexp);
+
+  at::cuda::OptionalCUDAGuard device_guard(query.device());
+  const int batch = query.size(0);
+  const int num_queries = query.size(1);
+  const int num_keys = key_indices.size(2);
+  const int height = key.size(1);
+  const int width = key.size(2);
+  const int heads = query.size(2);
+  const int dim = query.size(3);
+  const int dim_value = value.size(4);
+
+  dim3 grid(num_queries, heads, batch);
+  size_t smem_bytes = num_keys * sizeof(float) + 2 * num_keys * sizeof(int);
+  auto stream = at::cuda::getCurrentCUDAStream(query.device().index());
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      query.scalar_type(),
+      "sparse_na2d_sparse_kernel_forward",
+      [&] {
+        using q_scalar_t = scalar_t;
+        if (key_indices.scalar_type() == torch::kInt32) {
+          sparse_na2d_sparse_kernel_forward_kernel<q_scalar_t, int32_t>
+              <<<grid, kSimpleThreads, smem_bytes, stream>>>(
+                  query.data_ptr<q_scalar_t>(),
+                  key.data_ptr<q_scalar_t>(),
+                  value.data_ptr<q_scalar_t>(),
+                  key_indices.data_ptr<int32_t>(),
+                  out.data_ptr<q_scalar_t>(),
+                  logsumexp.data_ptr<float>(),
+                  batch,
+                  num_queries,
+                  num_keys,
+                  height,
+                  width,
+                  heads,
+                  dim,
+                  dim_value,
+                  attn_scale);
+        } else {
+          sparse_na2d_sparse_kernel_forward_kernel<q_scalar_t, int64_t>
+              <<<grid, kSimpleThreads, smem_bytes, stream>>>(
+                  query.data_ptr<q_scalar_t>(),
+                  key.data_ptr<q_scalar_t>(),
+                  value.data_ptr<q_scalar_t>(),
+                  key_indices.data_ptr<int64_t>(),
+                  out.data_ptr<q_scalar_t>(),
+                  logsumexp.data_ptr<float>(),
+                  batch,
+                  num_queries,
+                  num_keys,
+                  height,
+                  width,
+                  heads,
+                  dim,
+                  dim_value,
+                  attn_scale);
+        }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -2143,6 +2518,105 @@ void sparse_na2d_bilinear_backward(
                       kernel_h,
                       kernel_w);
             });
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void sparse_na2d_sparse_kernel_backward(
+    at::Tensor& grad_query,
+    at::Tensor& grad_key,
+    at::Tensor& grad_value,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& key_indices,
+    const at::Tensor& out,
+    const at::Tensor& grad_out,
+    const at::Tensor& logsumexp,
+    float attn_scale) {
+  check_sparse_na2d_sparse_kernel_args(query, key, value, key_indices);
+  CHECK_CONTIGUOUS(grad_query);
+  CHECK_CONTIGUOUS(grad_key);
+  CHECK_CONTIGUOUS(grad_value);
+  CHECK_CONTIGUOUS(out);
+  CHECK_CONTIGUOUS(grad_out);
+  CHECK_CONTIGUOUS(logsumexp);
+  CHECK_CUDA(grad_query);
+  CHECK_CUDA(grad_key);
+  CHECK_CUDA(grad_value);
+  CHECK_CUDA(out);
+  CHECK_CUDA(grad_out);
+  CHECK_CUDA(logsumexp);
+
+  grad_key.zero_();
+  grad_value.zero_();
+
+  at::cuda::OptionalCUDAGuard device_guard(query.device());
+  const int batch = query.size(0);
+  const int num_queries = query.size(1);
+  const int num_keys = key_indices.size(2);
+  const int height = key.size(1);
+  const int width = key.size(2);
+  const int heads = query.size(2);
+  const int dim = query.size(3);
+  const int dim_value = value.size(4);
+
+  dim3 grid(num_queries, heads, batch);
+  size_t smem_bytes = (2 * num_keys + kSimpleThreads) * sizeof(float) +
+      2 * num_keys * sizeof(int);
+  auto stream = at::cuda::getCurrentCUDAStream(query.device().index());
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      query.scalar_type(),
+      "sparse_na2d_sparse_kernel_backward",
+      [&] {
+        using q_scalar_t = scalar_t;
+        if (key_indices.scalar_type() == torch::kInt32) {
+          sparse_na2d_sparse_kernel_backward_kernel<q_scalar_t, int32_t>
+              <<<grid, kSimpleThreads, smem_bytes, stream>>>(
+                  query.data_ptr<q_scalar_t>(),
+                  key.data_ptr<q_scalar_t>(),
+                  value.data_ptr<q_scalar_t>(),
+                  key_indices.data_ptr<int32_t>(),
+                  out.data_ptr<q_scalar_t>(),
+                  grad_out.data_ptr<q_scalar_t>(),
+                  logsumexp.data_ptr<float>(),
+                  grad_query.data_ptr<q_scalar_t>(),
+                  grad_key.data_ptr<q_scalar_t>(),
+                  grad_value.data_ptr<q_scalar_t>(),
+                  batch,
+                  num_queries,
+                  num_keys,
+                  height,
+                  width,
+                  heads,
+                  dim,
+                  dim_value,
+                  attn_scale);
+        } else {
+          sparse_na2d_sparse_kernel_backward_kernel<q_scalar_t, int64_t>
+              <<<grid, kSimpleThreads, smem_bytes, stream>>>(
+                  query.data_ptr<q_scalar_t>(),
+                  key.data_ptr<q_scalar_t>(),
+                  value.data_ptr<q_scalar_t>(),
+                  key_indices.data_ptr<int64_t>(),
+                  out.data_ptr<q_scalar_t>(),
+                  grad_out.data_ptr<q_scalar_t>(),
+                  logsumexp.data_ptr<float>(),
+                  grad_query.data_ptr<q_scalar_t>(),
+                  grad_key.data_ptr<q_scalar_t>(),
+                  grad_value.data_ptr<q_scalar_t>(),
+                  batch,
+                  num_queries,
+                  num_keys,
+                  height,
+                  width,
+                  heads,
+                  dim,
+                  dim_value,
+                  attn_scale);
+        }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

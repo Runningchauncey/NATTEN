@@ -56,6 +56,22 @@ def _reference_sparse_na2d(
     )
 
 
+def _reference_sparse_na2d_sparse_kernel(query, key, value, key_indices, scale=None):
+    scale = scale or query.shape[-1] ** -0.5
+    batch, num_queries, num_keys = key_indices.shape[:3]
+    height, width = key.shape[1:3]
+    ys = key_indices[..., 0].clamp(0, height - 1)
+    xs = key_indices[..., 1].clamp(0, width - 1)
+    batch_idx = torch.arange(batch, device=key_indices.device)[:, None, None]
+    sampled_key = key[batch_idx, ys, xs]
+    sampled_value = value[batch_idx, ys, xs]
+    logits = torch.einsum("bnhd,bnkhd->bnhk", query, sampled_key) * scale
+    probs = torch.softmax(logits, dim=-1)
+    output = torch.einsum("bnhk,bnkhe->bnhe", probs, sampled_value)
+    lse = torch.logsumexp(logits.float(), dim=-1)
+    return output, lse
+
+
 @pytest.mark.parametrize("sample_mode", ["indexed", "bilinear"])
 @pytest.mark.parametrize("kernel_size", [(1, 1), (3, 3), (3, 5)])
 def test_sparse_na2d_forward_matches_reference(kernel_size, sample_mode):
@@ -292,6 +308,111 @@ def test_sparse_na2d_bilinear_matches_sparse_na2d_fp16_even_dim():
         sample_mode="bilinear",
         return_lse=True,
     )
+    expected.backward(grad)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(actual_lse, expected_lse, rtol=2e-3, atol=2e-3)
+    for actual_grad, expected_grad in zip(actual_grads, (query_ref.grad, key_ref.grad, value_ref.grad)):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
+
+
+def test_sparse_na2d_sparse_kernel_matches_reference_forward_and_lse():
+    torch.manual_seed(12)
+    query = torch.randn(2, 6, 3, 8, device="cuda", dtype=torch.float32, requires_grad=True)
+    key = torch.randn(2, 4, 5, 3, 8, device="cuda", dtype=torch.float32, requires_grad=True)
+    value = torch.randn(2, 4, 5, 3, 6, device="cuda", dtype=torch.float32, requires_grad=True)
+    key_indices = torch.tensor(
+        [
+            [
+                [[0, 0], [0, 1], [1, 0], [1, 1]],
+                [[2, 3], [2, 4], [3, 3], [3, 4]],
+                [[-2, -1], [0, 0], [5, 6], [1, 2]],
+                [[1, 1], [1, 1], [2, 2], [2, 2]],
+                [[3, 0], [3, 1], [3, 2], [3, 3]],
+                [[0, 4], [1, 4], [2, 4], [3, 4]],
+            ],
+            [
+                [[0, 0], [1, 1], [2, 2], [3, 3]],
+                [[3, 4], [2, 3], [1, 2], [0, 1]],
+                [[4, 5], [-1, -1], [2, 2], [2, 2]],
+                [[1, 0], [1, 2], [1, 4], [1, 3]],
+                [[2, 0], [2, 1], [2, 2], [2, 3]],
+                [[3, 1], [3, 2], [3, 3], [3, 4]],
+            ],
+        ],
+        device="cuda",
+        dtype=torch.int64,
+    )
+
+    actual, actual_lse = natten.sparse_na2d_sparse_kernel(
+        query,
+        key,
+        value,
+        key_indices,
+        return_lse=True,
+    )
+    expected, expected_lse = _reference_sparse_na2d_sparse_kernel(query, key, value, key_indices)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-4, atol=1e-4)
+
+
+def test_sparse_na2d_sparse_kernel_matches_reference_backward():
+    torch.manual_seed(13)
+    query = torch.randn(1, 5, 2, 8, device="cuda", dtype=torch.float32, requires_grad=True)
+    key = torch.randn(1, 4, 5, 2, 8, device="cuda", dtype=torch.float32, requires_grad=True)
+    value = torch.randn(1, 4, 5, 2, 7, device="cuda", dtype=torch.float32, requires_grad=True)
+    key_indices = torch.tensor(
+        [
+            [
+                [[0, 0], [0, 0], [1, 1], [2, 2], [3, 4]],
+                [[-1, -2], [0, 1], [0, 2], [4, 5], [3, 4]],
+                [[2, 1], [2, 2], [2, 3], [2, 4], [2, 4]],
+                [[1, 0], [1, 1], [1, 2], [1, 3], [1, 4]],
+                [[3, 0], [3, 1], [3, 2], [3, 3], [3, 4]],
+            ]
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    grad = torch.randn(1, 5, 2, 7, device="cuda", dtype=torch.float32)
+
+    actual = natten.sparse_na2d_sparse_kernel(query, key, value, key_indices)
+    actual.backward(grad)
+    actual_grads = (query.grad.detach().clone(), key.grad.detach().clone(), value.grad.detach().clone())
+
+    query_ref = query.detach().clone().requires_grad_(True)
+    key_ref = key.detach().clone().requires_grad_(True)
+    value_ref = value.detach().clone().requires_grad_(True)
+    expected, _ = _reference_sparse_na2d_sparse_kernel(query_ref, key_ref, value_ref, key_indices)
+    expected.backward(grad)
+
+    for actual_grad, expected_grad in zip(actual_grads, (query_ref.grad, key_ref.grad, value_ref.grad)):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-4, atol=1e-4)
+
+
+def test_sparse_na2d_sparse_kernel_matches_reference_fp16_even_dim():
+    torch.manual_seed(14)
+    query = torch.randn(2, 7, 3, 32, device="cuda", dtype=torch.float16, requires_grad=True)
+    key = torch.randn(2, 9, 10, 3, 32, device="cuda", dtype=torch.float16, requires_grad=True)
+    value = torch.randn(2, 9, 10, 3, 32, device="cuda", dtype=torch.float16, requires_grad=True)
+    key_indices = torch.randint(-2, 12, (2, 7, 11, 2), device="cuda", dtype=torch.int64)
+    grad = torch.randn(2, 7, 3, 32, device="cuda", dtype=torch.float16)
+
+    actual, actual_lse = natten.sparse_na2d_sparse_kernel(
+        query,
+        key,
+        value,
+        key_indices,
+        return_lse=True,
+    )
+    actual.backward(grad)
+    actual_grads = (query.grad.detach().clone(), key.grad.detach().clone(), value.grad.detach().clone())
+
+    query_ref = query.detach().clone().requires_grad_(True)
+    key_ref = key.detach().clone().requires_grad_(True)
+    value_ref = value.detach().clone().requires_grad_(True)
+    expected, expected_lse = _reference_sparse_na2d_sparse_kernel(query_ref, key_ref, value_ref, key_indices)
     expected.backward(grad)
 
     torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)

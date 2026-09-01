@@ -34,6 +34,7 @@ import natten
 from natten import sparse_na2d as natten_sparse_na2d
 from natten import sparse_na2d_bilinear as natten_sparse_na2d_bilinear
 from natten import sparse_na2d_simple as natten_sparse_na2d_simple
+from natten import sparse_na2d_sparse_kernel as natten_sparse_na2d_sparse_kernel
 from natten.functional import neighborhood_attention_generic
 
 
@@ -83,6 +84,34 @@ def make_grid_coords(
     if num_queries is not None:
         coords = coords[:, :num_queries]
     return coords.expand(batch, -1, -1).contiguous()
+
+
+def make_indexed_key_indices(
+    coords: torch.Tensor,
+    height: int,
+    width: int,
+    kernel_size: Tuple[int, int],
+) -> torch.Tensor:
+    center_y = torch.round(((coords[..., 0] + 1.0) * 0.5 * height) - 0.5).to(torch.int64)
+    center_x = torch.round(((coords[..., 1] + 1.0) * 0.5 * width) - 0.5).to(torch.int64)
+    center_y = center_y.clamp(0, height - 1)
+    center_x = center_x.clamp(0, width - 1)
+    kh, kw = kernel_size
+    ys = torch.arange(-(kh // 2), kh // 2 + 1, device=coords.device, dtype=torch.int64)
+    xs = torch.arange(-(kw // 2), kw // 2 + 1, device=coords.device, dtype=torch.int64)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    offsets = torch.stack((yy.reshape(-1), xx.reshape(-1)), dim=-1)
+    key_indices = torch.empty(
+        coords.shape[0],
+        coords.shape[1],
+        offsets.shape[0],
+        2,
+        device=coords.device,
+        dtype=torch.int64,
+    )
+    key_indices[..., 0] = (center_y.unsqueeze(-1) + offsets[:, 0]).clamp(0, height - 1)
+    key_indices[..., 1] = (center_x.unsqueeze(-1) + offsets[:, 1]).clamp(0, width - 1)
+    return key_indices.contiguous()
 
 
 def make_inputs(case: Case, dtype: torch.dtype) -> Tuple[torch.Tensor, ...]:
@@ -236,6 +265,7 @@ def benchmark_case(
     use_reentrant: bool,
 ) -> None:
     query, sparse_query, key, value, coords, dense_grad, sparse_grad = make_inputs(case, dtype)
+    key_indices = make_indexed_key_indices(coords, case.height, case.width, case.kernel_size)
 
     def dense_na(query_arg: torch.Tensor, key_arg: torch.Tensor, value_arg: torch.Tensor) -> torch.Tensor:
         return neighborhood_attention_generic(
@@ -293,6 +323,20 @@ def benchmark_case(
             scale=case.scale,
         )
 
+    def sparse_na_sparse_kernel(
+        query_arg: torch.Tensor,
+        key_arg: torch.Tensor,
+        value_arg: torch.Tensor,
+        key_indices_arg: torch.Tensor,
+    ) -> torch.Tensor:
+        return natten_sparse_na2d_sparse_kernel(
+            query_arg,
+            key_arg,
+            value_arg,
+            key_indices_arg,
+            scale=case.scale,
+        )
+
     dense_fn = lambda: dense_na(query, key, value)
     dense_checkpointed_fn = lambda: run_checkpointed(dense_na, query, key, value, use_reentrant=use_reentrant)
     sparse_fn = lambda: sparse_na(sparse_query, key, value, coords)
@@ -320,6 +364,15 @@ def benchmark_case(
         key,
         value,
         coords,
+        use_reentrant=use_reentrant,
+    )
+    sparse_kernel_fn = lambda: sparse_na_sparse_kernel(sparse_query, key, value, key_indices)
+    sparse_kernel_checkpointed_fn = lambda: run_checkpointed(
+        sparse_na_sparse_kernel,
+        sparse_query,
+        key,
+        value,
+        key_indices,
         use_reentrant=use_reentrant,
     )
 
@@ -369,6 +422,20 @@ def benchmark_case(
         warmup,
         iters,
     )
+    sparse_kernel_fwd, sparse_kernel_fwd_ckpt = benchmark_forward(
+        sparse_kernel_fn,
+        sparse_kernel_checkpointed_fn,
+        warmup,
+        iters,
+    )
+    sparse_kernel_bwd, sparse_kernel_bwd_ckpt = benchmark_backward(
+        (sparse_query, key, value),
+        sparse_grad,
+        sparse_kernel_fn,
+        sparse_kernel_checkpointed_fn,
+        warmup,
+        iters,
+    )
 
     kh, kw = case.kernel_size
     print(
@@ -385,10 +452,12 @@ def benchmark_case(
     print(f"natten_sparse_na2d ckpt              {sparse_fwd_ckpt[0]:8.3f} +/- {sparse_fwd_ckpt[1]:6.3f}  {sparse_bwd_ckpt[0]:8.3f} +/- {sparse_bwd_ckpt[1]:6.3f}")
     print(f"natten_sparse_na2d_simple            {sparse_simple_fwd[0]:8.3f} +/- {sparse_simple_fwd[1]:6.3f}  {sparse_simple_bwd[0]:8.3f} +/- {sparse_simple_bwd[1]:6.3f}")
     print(f"natten_sparse_na2d_simple ckpt       {sparse_simple_fwd_ckpt[0]:8.3f} +/- {sparse_simple_fwd_ckpt[1]:6.3f}  {sparse_simple_bwd_ckpt[0]:8.3f} +/- {sparse_simple_bwd_ckpt[1]:6.3f}")
+    print(f"natten_sparse_na2d_sparse_kernel     {sparse_kernel_fwd[0]:8.3f} +/- {sparse_kernel_fwd[1]:6.3f}  {sparse_kernel_bwd[0]:8.3f} +/- {sparse_kernel_bwd[1]:6.3f}")
+    print(f"natten_sparse_na2d_sparse_kernel ckpt {sparse_kernel_fwd_ckpt[0]:8.3f} +/- {sparse_kernel_fwd_ckpt[1]:6.3f}  {sparse_kernel_bwd_ckpt[0]:8.3f} +/- {sparse_kernel_bwd_ckpt[1]:6.3f}")
     print(f"natten_sparse_na2d_bilinear          {sparse_bilinear_fwd[0]:8.3f} +/- {sparse_bilinear_fwd[1]:6.3f}  {sparse_bilinear_bwd[0]:8.3f} +/- {sparse_bilinear_bwd[1]:6.3f}")
     print(f"natten_sparse_na2d_bilinear ckpt     {sparse_bilinear_fwd_ckpt[0]:8.3f} +/- {sparse_bilinear_fwd_ckpt[1]:6.3f}  {sparse_bilinear_bwd_ckpt[0]:8.3f} +/- {sparse_bilinear_bwd_ckpt[1]:6.3f}")
 
-    del query, sparse_query, key, value, coords, dense_grad, sparse_grad
+    del query, sparse_query, key, value, coords, key_indices, dense_grad, sparse_grad
     gc.collect()
     torch.cuda.empty_cache()
 

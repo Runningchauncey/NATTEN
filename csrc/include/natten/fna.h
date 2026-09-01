@@ -108,6 +108,15 @@ void sparse_na2d_bilinear_forward(
     const std::tuple<int32_t, int32_t>& kernel_size,
     float attn_scale);
 
+void sparse_na2d_sparse_kernel_forward(
+    at::Tensor& out,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& key_indices,
+    at::Tensor& logsumexp,
+    float attn_scale);
+
 // Backward
 
 void na1d_backward(
@@ -213,6 +222,19 @@ void sparse_na2d_bilinear_backward(
     const at::Tensor& grad_out,
     const at::Tensor& logsumexp,
     const std::tuple<int32_t, int32_t>& kernel_size,
+    float attn_scale);
+
+void sparse_na2d_sparse_kernel_backward(
+    at::Tensor& grad_query,
+    at::Tensor& grad_key,
+    at::Tensor& grad_value,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& key_indices,
+    const at::Tensor& out,
+    const at::Tensor& grad_out,
+    const at::Tensor& logsumexp,
     float attn_scale);
 
 } // namespace natten
