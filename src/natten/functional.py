@@ -31,6 +31,8 @@ from natten.attn_merge import merge_attentions
 from natten._libnatten import (
     sparse_na2d_bilinear_backward,
     sparse_na2d_bilinear_forward,
+    sparse_na2d_bilinear_query_neighbor_backward,
+    sparse_na2d_bilinear_query_neighbor_forward,
     sparse_na2d_backward,
     sparse_na2d_forward,
     sparse_na2d_simple_backward,
@@ -299,6 +301,123 @@ class SparseNa2dSparseKernelAutogradFn(Function):
         return grad_query, grad_key, grad_value, None, None
 
 
+class SparseNa2dBilinearQueryNeighborAutogradFn(Function):
+    @staticmethod
+    @amp_fwd
+    def forward(
+        ctx,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        coords: Tensor,
+        q_norm_weight: Tensor,
+        k_norm_weight: Tensor,
+        rope_freqs: Tensor,
+        kernel_size: Tuple[int, int],
+        offset_scale_y: float,
+        offset_scale_x: float,
+        scale: float,
+        qk_norm_eps: float,
+        qk_norm_before_rope: bool,
+    ) -> Tuple[Tensor, Tensor]:
+        tensors = [
+            tensor.contiguous()
+            for tensor in (
+                query,
+                key,
+                value,
+                coords,
+                q_norm_weight,
+                k_norm_weight,
+                rope_freqs,
+            )
+        ]
+        query, key, value, coords, q_norm_weight, k_norm_weight, rope_freqs = tensors
+        output, logsumexp = sparse_na2d_bilinear_query_neighbor_forward(
+            query,
+            key,
+            value,
+            coords,
+            q_norm_weight,
+            k_norm_weight,
+            rope_freqs,
+            list(kernel_size),
+            offset_scale_y,
+            offset_scale_x,
+            scale,
+            qk_norm_eps,
+            qk_norm_before_rope,
+        )
+        ctx.save_for_backward(
+            query,
+            key,
+            value,
+            coords,
+            q_norm_weight,
+            k_norm_weight,
+            rope_freqs,
+            output,
+            logsumexp,
+        )
+        ctx.kernel_size = kernel_size
+        ctx.offset_scale_y = offset_scale_y
+        ctx.offset_scale_x = offset_scale_x
+        ctx.scale = scale
+        ctx.qk_norm_eps = qk_norm_eps
+        ctx.qk_norm_before_rope = qk_norm_before_rope
+        return output, logsumexp
+
+    @staticmethod
+    @amp_bwd
+    def backward(ctx, grad_output: Tensor, grad_lse: Optional[Tensor] = None):
+        del grad_lse
+        (
+            query,
+            key,
+            value,
+            coords,
+            q_norm_weight,
+            k_norm_weight,
+            rope_freqs,
+            output,
+            logsumexp,
+        ) = ctx.saved_tensors
+        grads = sparse_na2d_bilinear_query_neighbor_backward(
+            query,
+            key,
+            value,
+            coords,
+            q_norm_weight,
+            k_norm_weight,
+            rope_freqs,
+            output,
+            grad_output.contiguous(),
+            logsumexp,
+            list(ctx.kernel_size),
+            ctx.offset_scale_y,
+            ctx.offset_scale_x,
+            ctx.scale,
+            ctx.qk_norm_eps,
+            ctx.qk_norm_before_rope,
+        )
+        grad_query, grad_key, grad_value, grad_q_weight, grad_k_weight, grad_rope = grads
+        return (
+            grad_query,
+            grad_key,
+            grad_value,
+            None,
+            grad_q_weight,
+            grad_k_weight,
+            grad_rope,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def _check_sparse_na2d_inputs(
     query: Tensor,
     key: Tensor,
@@ -473,6 +592,92 @@ def sparse_na2d_bilinear(
     if return_lse:
         return output, lse
     return output
+
+
+def sparse_na2d_bilinear_query_neighbor(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    kernel_size: Dimension2DTypeOrDed,
+    q_norm_weight: Tensor,
+    k_norm_weight: Tensor,
+    rope_freqs: Tensor,
+    query_resolution: Optional[Tuple[int, int]] = None,
+    offset_scale: Optional[Tuple[float, float]] = None,
+    scale: Optional[float] = None,
+    qk_norm_eps: Optional[float] = None,
+    qk_norm_before_rope: bool = True,
+    return_lse: bool = False,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """Fused bilinear sparse attention with query-neighbor spacing, RMSNorm, and RoPE.
+
+    Neighborhood offsets are measured in normalized coordinate units. Passing
+    ``query_resolution=(Hq, Wq)`` uses steps ``(2 / Hq, 2 / Wq)``; direct
+    ``offset_scale=(step_y, step_x)`` is also supported. Sampling follows
+    ``grid_sample`` border behavior with ``align_corners=False``.
+    """
+    kernel_size = _check_sparse_na2d_inputs(
+        query,
+        key,
+        value,
+        coords,
+        kernel_size,
+        op_name="sparse_na2d_bilinear_query_neighbor",
+    )
+    if query_resolution is not None and offset_scale is not None:
+        raise ValueError("query_resolution and offset_scale are mutually exclusive.")
+    if query_resolution is not None:
+        if len(query_resolution) != 2 or any(int(size) <= 0 for size in query_resolution):
+            raise ValueError(f"query_resolution must contain two positive values, got {query_resolution}.")
+        offset_scale = (2.0 / int(query_resolution[0]), 2.0 / int(query_resolution[1]))
+    elif offset_scale is None:
+        offset_scale = (2.0 / key.shape[1], 2.0 / key.shape[2])
+    else:
+        if len(offset_scale) != 2 or any(float(step) < 0 for step in offset_scale):
+            raise ValueError(f"offset_scale must contain two non-negative values, got {offset_scale}.")
+        offset_scale = (float(offset_scale[0]), float(offset_scale[1]))
+
+    full_dim = query.shape[2] * query.shape[3]
+    if full_dim % 2 != 0:
+        raise ValueError(f"RoPE requires heads * head_dim to be even, got {full_dim}.")
+    if q_norm_weight.numel() != full_dim or k_norm_weight.numel() != full_dim:
+        raise ValueError(f"Q/K RMSNorm weights must each have {full_dim} values.")
+    if tuple(rope_freqs.shape) != (2, full_dim):
+        raise ValueError(f"rope_freqs must have shape {(2, full_dim)}, got {tuple(rope_freqs.shape)}.")
+    for name, tensor in (
+        ("q_norm_weight", q_norm_weight),
+        ("k_norm_weight", k_norm_weight),
+        ("rope_freqs", rope_freqs),
+    ):
+        if tensor.device != query.device:
+            raise ValueError(f"{name} must be on {query.device}, got {tensor.device}.")
+        if not tensor.is_floating_point():
+            raise ValueError(f"{name} must be floating point, got {tensor.dtype}.")
+
+    # Keeping these casts outside the custom Function preserves gradients to
+    # float32 module parameters under autocast.
+    q_norm_weight = q_norm_weight.to(dtype=query.dtype)
+    k_norm_weight = k_norm_weight.to(dtype=query.dtype)
+    rope_freqs = rope_freqs.to(dtype=query.dtype)
+    scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
+    qk_norm_eps = torch.finfo(query.dtype).eps if qk_norm_eps is None else float(qk_norm_eps)
+    output, lse = SparseNa2dBilinearQueryNeighborAutogradFn.apply(
+        query,
+        key,
+        value,
+        coords,
+        q_norm_weight,
+        k_norm_weight,
+        rope_freqs,
+        kernel_size,
+        float(offset_scale[0]),
+        float(offset_scale[1]),
+        scale,
+        qk_norm_eps,
+        qk_norm_before_rope,
+    )
+    return (output, lse) if return_lse else output
 
 
 # Standard Attention

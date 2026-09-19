@@ -63,6 +63,7 @@ from natten.functional import (
     na3d,
     sparse_na2d,
     sparse_na2d_bilinear,
+    sparse_na2d_bilinear_query_neighbor,
     sparse_na2d_simple,
     sparse_na2d_sparse_kernel,
 )
@@ -113,6 +114,7 @@ __all__ = [
     "na3d",
     "sparse_na2d",
     "sparse_na2d_bilinear",
+    "sparse_na2d_bilinear_query_neighbor",
     "sparse_na2d_simple",
     "sparse_na2d_sparse_kernel",
     "attention",

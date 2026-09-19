@@ -108,6 +108,23 @@ void sparse_na2d_bilinear_forward(
     const std::tuple<int32_t, int32_t>& kernel_size,
     float attn_scale);
 
+void sparse_na2d_bilinear_query_neighbor_forward(
+    at::Tensor& out,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& coords,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    const at::Tensor& rope_freqs,
+    at::Tensor& logsumexp,
+    const std::tuple<int32_t, int32_t>& kernel_size,
+    float offset_scale_y,
+    float offset_scale_x,
+    float attn_scale,
+    float norm_eps,
+    bool norm_before_rope);
+
 void sparse_na2d_sparse_kernel_forward(
     at::Tensor& out,
     const at::Tensor& query,
@@ -223,6 +240,30 @@ void sparse_na2d_bilinear_backward(
     const at::Tensor& logsumexp,
     const std::tuple<int32_t, int32_t>& kernel_size,
     float attn_scale);
+
+void sparse_na2d_bilinear_query_neighbor_backward(
+    at::Tensor& grad_query,
+    at::Tensor& grad_key,
+    at::Tensor& grad_value,
+    at::Tensor& grad_q_weight,
+    at::Tensor& grad_k_weight,
+    at::Tensor& grad_rope_freqs,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& coords,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    const at::Tensor& rope_freqs,
+    const at::Tensor& out,
+    const at::Tensor& grad_out,
+    const at::Tensor& logsumexp,
+    const std::tuple<int32_t, int32_t>& kernel_size,
+    float offset_scale_y,
+    float offset_scale_x,
+    float attn_scale,
+    float norm_eps,
+    bool norm_before_rope);
 
 void sparse_na2d_sparse_kernel_backward(
     at::Tensor& grad_query,

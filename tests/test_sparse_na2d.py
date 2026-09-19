@@ -26,7 +26,10 @@ import torch
 
 import natten
 from natten._environment import _IS_CUDA_AVAILABLE, HAS_LIBNATTEN
-from natten.sparse_na2d_reference import sparse_na2d_pytorch
+from natten.sparse_na2d_reference import (
+    sparse_na2d_bilinear_query_neighbor_pytorch,
+    sparse_na2d_pytorch,
+)
 
 pytestmark = pytest.mark.skipif(
     not _IS_CUDA_AVAILABLE or not HAS_LIBNATTEN,
@@ -556,3 +559,127 @@ def test_sparse_na2d_does_not_break_dense_na2d_smoke():
     assert query.grad is not None
     assert key.grad is not None
     assert value.grad is not None
+
+
+@pytest.mark.parametrize("kernel_size", [(3, 3), (3, 5)])
+@pytest.mark.parametrize("qk_norm_before_rope", [True, False])
+def test_sparse_na2d_bilinear_query_neighbor_matches_reference(kernel_size, qk_norm_before_rope):
+    torch.manual_seed(11)
+    shapes = (1, 6, 5, 7, 4, 4, 6)
+    batch, num_queries, height, width, heads, dim, dim_value = shapes
+    tensors = [
+        torch.randn(batch, num_queries, heads, dim, device="cuda", requires_grad=True),
+        torch.randn(batch, height, width, heads, dim, device="cuda", requires_grad=True),
+        torch.randn(batch, height, width, heads, dim_value, device="cuda", requires_grad=True),
+        torch.randn(heads * dim, device="cuda", requires_grad=True),
+        torch.randn(heads * dim, device="cuda", requires_grad=True),
+        (torch.randn(2, heads * dim, device="cuda") * 0.5).requires_grad_(True),
+    ]
+    query, key, value, q_weight, k_weight, rope_freqs = tensors
+    coords = torch.tensor(
+        [[[-1.0, -1.0], [1.0, 1.0], [-0.97, 0.94], [0.0, 0.0], [0.31, -0.22], [0.8, -0.9]]],
+        device="cuda",
+    )
+    grad = torch.randn(batch, num_queries, heads, dim_value, device="cuda")
+
+    actual, actual_lse = natten.sparse_na2d_bilinear_query_neighbor(
+        query,
+        key,
+        value,
+        coords,
+        kernel_size,
+        q_weight,
+        k_weight,
+        rope_freqs,
+        query_resolution=(13, 17),
+        qk_norm_eps=1e-6,
+        qk_norm_before_rope=qk_norm_before_rope,
+        return_lse=True,
+    )
+    actual.backward(grad)
+    actual_grads = [tensor.grad.detach().clone() for tensor in tensors]
+
+    reference_tensors = [tensor.detach().clone().requires_grad_(True) for tensor in tensors]
+    expected, expected_lse = sparse_na2d_bilinear_query_neighbor_pytorch(
+        reference_tensors[0],
+        reference_tensors[1],
+        reference_tensors[2],
+        coords,
+        kernel_size,
+        reference_tensors[3],
+        reference_tensors[4],
+        reference_tensors[5],
+        query_resolution=(13, 17),
+        qk_norm_eps=1e-6,
+        qk_norm_before_rope=qk_norm_before_rope,
+        return_lse=True,
+    )
+    expected.backward(grad)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(actual_lse, expected_lse, rtol=2e-4, atol=2e-4)
+    for actual_grad, reference_tensor in zip(actual_grads, reference_tensors):
+        torch.testing.assert_close(actual_grad, reference_tensor.grad, rtol=5e-4, atol=5e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("qk_norm_before_rope", [True, False])
+def test_sparse_na2d_bilinear_query_neighbor_low_precision(dtype, qk_norm_before_rope):
+    torch.manual_seed(12)
+    query = torch.randn(1, 5, 4, 8, device="cuda", dtype=dtype, requires_grad=True)
+    key = torch.randn(1, 6, 5, 4, 8, device="cuda", dtype=dtype, requires_grad=True)
+    value = torch.randn(1, 6, 5, 4, 9, device="cuda", dtype=dtype, requires_grad=True)
+    coords = torch.rand(1, 5, 2, device="cuda", dtype=torch.float32) * 2 - 1
+    q_weight = torch.randn(32, device="cuda", dtype=torch.float32, requires_grad=True)
+    k_weight = torch.randn(32, device="cuda", dtype=torch.float32, requires_grad=True)
+    rope_freqs = torch.randn(2, 32, device="cuda", dtype=torch.float32, requires_grad=True)
+    grad = torch.randn(1, 5, 4, 9, device="cuda", dtype=dtype)
+    inputs = (query, key, value, q_weight, k_weight, rope_freqs)
+
+    actual = natten.sparse_na2d_bilinear_query_neighbor(
+        query,
+        key,
+        value,
+        coords,
+        (5, 3),
+        q_weight,
+        k_weight,
+        rope_freqs,
+        offset_scale=(2 / 19, 2 / 11),
+        qk_norm_eps=1e-5,
+        qk_norm_before_rope=qk_norm_before_rope,
+    )
+    actual.backward(grad)
+    actual_grads = [tensor.grad.detach().clone() for tensor in inputs]
+
+    refs = [tensor.detach().clone().requires_grad_(True) for tensor in inputs]
+    expected = sparse_na2d_bilinear_query_neighbor_pytorch(
+        refs[0], refs[1], refs[2], coords, (5, 3), refs[3], refs[4], refs[5],
+        offset_scale=(2 / 19, 2 / 11), qk_norm_eps=1e-5,
+        qk_norm_before_rope=qk_norm_before_rope,
+    )
+    expected.backward(grad)
+    tolerance = 4e-2 if dtype == torch.bfloat16 else 1e-2
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+    for actual_grad, reference_tensor in zip(actual_grads, refs):
+        torch.testing.assert_close(actual_grad, reference_tensor.grad, rtol=0.12, atol=0.12)
+
+
+def test_sparse_na2d_bilinear_query_neighbor_resolution_matches_offset_scale():
+    torch.manual_seed(13)
+    query = torch.randn(1, 4, 2, 8, device="cuda")
+    key = torch.randn(1, 5, 7, 2, 8, device="cuda")
+    value = torch.randn(1, 5, 7, 2, 6, device="cuda")
+    coords = torch.rand(1, 4, 2, device="cuda") * 2 - 1
+    q_weight = torch.randn(16, device="cuda")
+    k_weight = torch.randn(16, device="cuda")
+    rope_freqs = torch.randn(2, 16, device="cuda")
+    from_resolution = natten.sparse_na2d_bilinear_query_neighbor(
+        query, key, value, coords, (3, 3), q_weight, k_weight, rope_freqs,
+        query_resolution=(11, 13),
+    )
+    from_scale = natten.sparse_na2d_bilinear_query_neighbor(
+        query, key, value, coords, (3, 3), q_weight, k_weight, rope_freqs,
+        offset_scale=(2 / 11, 2 / 13),
+    )
+    torch.testing.assert_close(from_resolution, from_scale, rtol=0, atol=0)

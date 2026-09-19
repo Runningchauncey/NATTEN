@@ -323,3 +323,76 @@ def sparse_na2d_pytorch(
     if return_lse:
         return output, logits.logsumexp(dim=-1)
     return output
+
+
+def sparse_na2d_bilinear_query_neighbor_pytorch(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    kernel_size: Union[int, Tuple[int, int]],
+    q_norm_weight: Tensor,
+    k_norm_weight: Tensor,
+    rope_freqs: Tensor,
+    query_resolution: Optional[Tuple[int, int]] = None,
+    offset_scale: Optional[Tuple[float, float]] = None,
+    scale: Optional[float] = None,
+    qk_norm_eps: Optional[float] = None,
+    qk_norm_before_rope: bool = True,
+    return_lse: bool = False,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """Materialized reference for query-neighbor bilinear sparse attention."""
+    if isinstance(kernel_size, int):
+        kernel_size = (kernel_size, kernel_size)
+    else:
+        kernel_size = tuple(kernel_size)
+    if query_resolution is not None and offset_scale is not None:
+        raise ValueError("query_resolution and offset_scale are mutually exclusive.")
+    _, height, width, heads, dim = key.shape
+    if query_resolution is not None:
+        offset_scale = (2.0 / query_resolution[0], 2.0 / query_resolution[1])
+    elif offset_scale is None:
+        offset_scale = (2.0 / height, 2.0 / width)
+
+    kh, kw = kernel_size
+    oy = torch.arange(-(kh // 2), kh // 2 + 1, device=coords.device, dtype=coords.dtype)
+    ox = torch.arange(-(kw // 2), kw // 2 + 1, device=coords.device, dtype=coords.dtype)
+    yy, xx = torch.meshgrid(oy, ox, indexing="ij")
+    sample_y = (coords[..., 0, None] + yy.reshape(-1) * offset_scale[0]).clamp(-1, 1)
+    sample_x = (coords[..., 1, None] + xx.reshape(-1) * offset_scale[1]).clamp(-1, 1)
+    sample_grid = torch.stack((sample_x, sample_y), dim=-1)
+    key_local = sample_sparse_na2d_neighborhood(key, sample_grid)
+    value_local = sample_sparse_na2d_neighborhood(value, sample_grid)
+
+    batch, num_queries = query.shape[:2]
+    channels = heads * dim
+    query_full = query.reshape(batch, num_queries, channels)
+    key_full = key_local.reshape(batch, num_queries, kh * kw, channels)
+    q_pos = ((coords + 1.0) * 0.5).to(query.dtype)
+    k_pos = torch.stack(((sample_y + 1.0) * 0.5, (sample_x + 1.0) * 0.5), dim=-1).to(query.dtype)
+    q_weight = q_norm_weight.to(query.dtype)
+    k_weight = k_norm_weight.to(query.dtype)
+    freqs = rope_freqs.to(query.dtype)
+    eps = torch.finfo(query.dtype).eps if qk_norm_eps is None else qk_norm_eps
+
+    def norm(x: Tensor, weight: Tensor) -> Tensor:
+        inv = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps).to(x.dtype)
+        return x * inv * weight
+
+    def rope(x: Tensor, pos: Tensor) -> Tensor:
+        angle = pos @ freqs
+        return x * angle.cos() + rotate_half(x) * angle.sin()
+
+    if qk_norm_before_rope:
+        query_full = rope(norm(query_full, q_weight), q_pos)
+        key_full = rope(norm(key_full, k_weight), k_pos)
+    else:
+        query_full = norm(rope(query_full, q_pos), q_weight)
+        key_full = norm(rope(key_full, k_pos), k_weight)
+
+    query_heads = query_full.reshape(batch, num_queries, heads, dim)
+    key_heads = key_full.reshape(batch, num_queries, kh * kw, heads, dim)
+    scale = dim**-0.5 if scale is None else scale
+    logits = torch.einsum("bnhd,bnkhd->bnhk", query_heads, key_heads) * scale
+    output = torch.einsum("bnhk,bnkhd->bnhd", logits.softmax(dim=-1), value_local)
+    return (output, torch.logsumexp(logits.float(), dim=-1)) if return_lse else output

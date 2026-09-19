@@ -147,6 +147,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "sparse_na2d_bilinear_backward", &natten::sparse_na2d_bilinear_backward, "Bilinear sparse coordinate NA2D backward");
 
   m.def(
+      "sparse_na2d_bilinear_query_neighbor_forward",
+      &natten::sparse_na2d_bilinear_query_neighbor_forward,
+      "Query-resolution bilinear sparse coordinate NA2D forward");
+
+  m.def(
+      "sparse_na2d_bilinear_query_neighbor_backward",
+      &natten::sparse_na2d_bilinear_query_neighbor_backward,
+      "Query-resolution bilinear sparse coordinate NA2D backward");
+
+  m.def(
       "sparse_na2d_sparse_kernel_forward",
       &natten::sparse_na2d_sparse_kernel_forward,
       "Predefined indexed sparse key-neighborhood NA2D forward");

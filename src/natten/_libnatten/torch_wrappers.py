@@ -61,6 +61,8 @@ from natten.libnatten import (  # type: ignore[import-untyped]
     reference_na3d_forward as reference_na3d_forward_cxx,
     sparse_na2d_bilinear_backward as sparse_na2d_bilinear_backward_cxx,
     sparse_na2d_bilinear_forward as sparse_na2d_bilinear_forward_cxx,
+    sparse_na2d_bilinear_query_neighbor_backward as sparse_na2d_bilinear_query_neighbor_backward_cxx,
+    sparse_na2d_bilinear_query_neighbor_forward as sparse_na2d_bilinear_query_neighbor_forward_cxx,
     sparse_na2d_backward as sparse_na2d_backward_cxx,
     sparse_na2d_forward as sparse_na2d_forward_cxx,
     sparse_na2d_simple_backward as sparse_na2d_simple_backward_cxx,
@@ -1732,6 +1734,195 @@ def sparse_na2d_bilinear_backward_torch_fake_op(
     return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
 
 
+@register_op(
+    "natten::sparse_na2d_bilinear_query_neighbor_forward",
+    mutates_args=(),
+    device_types="cuda",
+)
+def sparse_na2d_bilinear_query_neighbor_forward_torch_op(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    q_norm_weight: Tensor,
+    k_norm_weight: Tensor,
+    rope_freqs: Tensor,
+    kernel_size: list[int],
+    offset_scale_y: float,
+    offset_scale_x: float,
+    scale: float,
+    norm_eps: float,
+    norm_before_rope: bool,
+) -> Tuple[Tensor, Tensor]:
+    query, key, value, coords, q_norm_weight, k_norm_weight, rope_freqs = [
+        maybe_contiguous(x)
+        for x in (query, key, value, coords, q_norm_weight, k_norm_weight, rope_freqs)
+    ]
+    output = torch.empty(
+        [query.shape[0], query.shape[1], query.shape[2], value.shape[-1]],
+        device=query.device,
+        dtype=query.dtype,
+    )
+    logsumexp = torch.empty(query.shape[:-1], dtype=torch.float32, device=query.device)
+    sparse_na2d_bilinear_query_neighbor_forward_cxx(
+        output,
+        query,
+        key,
+        value,
+        coords,
+        q_norm_weight,
+        k_norm_weight,
+        rope_freqs,
+        logsumexp,
+        kernel_size,
+        offset_scale_y,
+        offset_scale_x,
+        scale,
+        norm_eps,
+        norm_before_rope,
+    )
+    return output, logsumexp
+
+
+@register_fake("natten::sparse_na2d_bilinear_query_neighbor_forward")
+def sparse_na2d_bilinear_query_neighbor_forward_torch_fake_op(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    q_norm_weight: Tensor,
+    k_norm_weight: Tensor,
+    rope_freqs: Tensor,
+    kernel_size: list[int],
+    offset_scale_y: float,
+    offset_scale_x: float,
+    scale: float,
+    norm_eps: float,
+    norm_before_rope: bool,
+) -> Tuple[Tensor, Tensor]:
+    del coords, q_norm_weight, k_norm_weight, rope_freqs, kernel_size
+    del offset_scale_y, offset_scale_x, scale, norm_eps, norm_before_rope
+    return (
+        torch.empty(
+            [query.shape[0], query.shape[1], query.shape[2], value.shape[-1]],
+            device=query.device,
+            dtype=query.dtype,
+        ),
+        torch.empty(query.shape[:-1], dtype=torch.float32, device=query.device),
+    )
+
+
+@register_op(
+    "natten::sparse_na2d_bilinear_query_neighbor_backward",
+    mutates_args=(),
+    device_types="cuda",
+)
+def sparse_na2d_bilinear_query_neighbor_backward_torch_op(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    q_norm_weight: Tensor,
+    k_norm_weight: Tensor,
+    rope_freqs: Tensor,
+    output: Tensor,
+    d_output: Tensor,
+    logsumexp: Tensor,
+    kernel_size: list[int],
+    offset_scale_y: float,
+    offset_scale_x: float,
+    scale: float,
+    norm_eps: float,
+    norm_before_rope: bool,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    tensors = [
+        maybe_contiguous(x)
+        for x in (
+            query,
+            key,
+            value,
+            coords,
+            q_norm_weight,
+            k_norm_weight,
+            rope_freqs,
+            output,
+            d_output,
+            logsumexp,
+        )
+    ]
+    (
+        query,
+        key,
+        value,
+        coords,
+        q_norm_weight,
+        k_norm_weight,
+        rope_freqs,
+        output,
+        d_output,
+        logsumexp,
+    ) = tensors
+    grads = (
+        torch.empty_like(query),
+        torch.empty_like(key),
+        torch.empty_like(value),
+        torch.empty_like(q_norm_weight),
+        torch.empty_like(k_norm_weight),
+        torch.empty_like(rope_freqs),
+    )
+    sparse_na2d_bilinear_query_neighbor_backward_cxx(
+        *grads,
+        query,
+        key,
+        value,
+        coords,
+        q_norm_weight,
+        k_norm_weight,
+        rope_freqs,
+        output,
+        d_output,
+        logsumexp,
+        kernel_size,
+        offset_scale_y,
+        offset_scale_x,
+        scale,
+        norm_eps,
+        norm_before_rope,
+    )
+    return grads
+
+
+@register_fake("natten::sparse_na2d_bilinear_query_neighbor_backward")
+def sparse_na2d_bilinear_query_neighbor_backward_torch_fake_op(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    coords: Tensor,
+    q_norm_weight: Tensor,
+    k_norm_weight: Tensor,
+    rope_freqs: Tensor,
+    output: Tensor,
+    d_output: Tensor,
+    logsumexp: Tensor,
+    kernel_size: list[int],
+    offset_scale_y: float,
+    offset_scale_x: float,
+    scale: float,
+    norm_eps: float,
+    norm_before_rope: bool,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    del coords, output, d_output, logsumexp, kernel_size
+    del offset_scale_y, offset_scale_x, scale, norm_eps, norm_before_rope
+    return (
+        torch.empty_like(query),
+        torch.empty_like(key),
+        torch.empty_like(value),
+        torch.empty_like(q_norm_weight),
+        torch.empty_like(k_norm_weight),
+        torch.empty_like(rope_freqs),
+    )
+
+
 def make_reference_fna_ops(na_dim):
     fwd_handle, bwd_handle = {
         1: (reference_na1d_forward_cxx, reference_na1d_backward_cxx),
@@ -2210,6 +2401,8 @@ if DISABLE_TORCH_OPS:
     sparse_na2d_simple_backward = sparse_na2d_simple_backward_torch_op
     sparse_na2d_bilinear_forward = sparse_na2d_bilinear_forward_torch_op
     sparse_na2d_bilinear_backward = sparse_na2d_bilinear_backward_torch_op
+    sparse_na2d_bilinear_query_neighbor_forward = sparse_na2d_bilinear_query_neighbor_forward_torch_op
+    sparse_na2d_bilinear_query_neighbor_backward = sparse_na2d_bilinear_query_neighbor_backward_torch_op
     sparse_na2d_sparse_kernel_forward = sparse_na2d_sparse_kernel_forward_torch_op
     sparse_na2d_sparse_kernel_backward = sparse_na2d_sparse_kernel_backward_torch_op
 
@@ -2274,6 +2467,8 @@ else:
     sparse_na2d_simple_backward = torch.ops.natten.sparse_na2d_simple_backward
     sparse_na2d_bilinear_forward = torch.ops.natten.sparse_na2d_bilinear_forward
     sparse_na2d_bilinear_backward = torch.ops.natten.sparse_na2d_bilinear_backward
+    sparse_na2d_bilinear_query_neighbor_forward = torch.ops.natten.sparse_na2d_bilinear_query_neighbor_forward
+    sparse_na2d_bilinear_query_neighbor_backward = torch.ops.natten.sparse_na2d_bilinear_query_neighbor_backward
     sparse_na2d_sparse_kernel_forward = torch.ops.natten.sparse_na2d_sparse_kernel_forward
     sparse_na2d_sparse_kernel_backward = torch.ops.natten.sparse_na2d_sparse_kernel_backward
 
@@ -2328,6 +2523,8 @@ __all__ = [
     "sparse_na2d_forward",
     "sparse_na2d_bilinear_backward",
     "sparse_na2d_bilinear_forward",
+    "sparse_na2d_bilinear_query_neighbor_backward",
+    "sparse_na2d_bilinear_query_neighbor_forward",
     "sparse_na2d_simple_backward",
     "sparse_na2d_simple_forward",
     "sparse_na2d_sparse_kernel_backward",
