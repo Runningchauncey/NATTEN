@@ -142,21 +142,101 @@ __device__ inline void qn_bilinear_atomic_add(
   at::native::fastAtomicAdd(grad, i11, numel, static_cast<scalar_t>(w11 * value), true);
 }
 
+__device__ inline float2 qn_bilinear_load_half2(
+    const at::Half* tensor,
+    int batch_idx,
+    int height,
+    int width,
+    int heads,
+    int head_idx,
+    int dim,
+    int channel,
+    int y0,
+    int y1,
+    int x0,
+    int x1,
+    float w00,
+    float w01,
+    float w10,
+    float w11) {
+  int i00 = ((((batch_idx * height + y0) * width + x0) * heads + head_idx) * dim) + channel;
+  int i01 = ((((batch_idx * height + y0) * width + x1) * heads + head_idx) * dim) + channel;
+  int i10 = ((((batch_idx * height + y1) * width + x0) * heads + head_idx) * dim) + channel;
+  int i11 = ((((batch_idx * height + y1) * width + x1) * heads + head_idx) * dim) + channel;
+  float2 v00 = __half22float2(*reinterpret_cast<const __half2*>(tensor + i00));
+  float2 v01 = __half22float2(*reinterpret_cast<const __half2*>(tensor + i01));
+  float2 v10 = __half22float2(*reinterpret_cast<const __half2*>(tensor + i10));
+  float2 v11 = __half22float2(*reinterpret_cast<const __half2*>(tensor + i11));
+  return make_float2(
+      w00 * v00.x + w01 * v01.x + w10 * v10.x + w11 * v11.x,
+      w00 * v00.y + w01 * v01.y + w10 * v10.y + w11 * v11.y);
+}
+
+__device__ inline void qn_bilinear_atomic_add_half2(
+    at::Half* grad,
+    int batch_idx,
+    int height,
+    int width,
+    int heads,
+    int head_idx,
+    int dim,
+    int channel,
+    int y0,
+    int y1,
+    int x0,
+    int x1,
+    float w00,
+    float w01,
+    float w10,
+    float w11,
+    float2 value) {
+  int i00 = ((((batch_idx * height + y0) * width + x0) * heads + head_idx) * dim) + channel;
+  int i01 = ((((batch_idx * height + y0) * width + x1) * heads + head_idx) * dim) + channel;
+  int i10 = ((((batch_idx * height + y1) * width + x0) * heads + head_idx) * dim) + channel;
+  int i11 = ((((batch_idx * height + y1) * width + x1) * heads + head_idx) * dim) + channel;
+  atomicAdd(reinterpret_cast<__half2*>(grad + i00), __floats2half2_rn(w00 * value.x, w00 * value.y));
+  atomicAdd(reinterpret_cast<__half2*>(grad + i01), __floats2half2_rn(w01 * value.x, w01 * value.y));
+  atomicAdd(reinterpret_cast<__half2*>(grad + i10), __floats2half2_rn(w10 * value.x, w10 * value.y));
+  atomicAdd(reinterpret_cast<__half2*>(grad + i11), __floats2half2_rn(w11 * value.x, w11 * value.y));
+}
+
 template <typename scalar_t>
 __device__ inline void qn_atomic_add(scalar_t* grad, int index, int numel, float value) {
   at::native::fastAtomicAdd(grad, index, numel, static_cast<scalar_t>(value), true);
 }
 
 __device__ inline float qn_block_sum(float value, float* reduction) {
-  reduction[threadIdx.x] = value;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-    }
-    __syncthreads();
+  constexpr unsigned kFullWarpMask = 0xffffffffu;
+  int lane = threadIdx.x & 31;
+  int warp = threadIdx.x >> 5;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(kFullWarpMask, value, offset);
   }
+  if (lane == 0) {
+    reduction[warp] = value;
+  }
+  __syncthreads();
+
+  float total = 0.0f;
+  if (warp == 0) {
+    total = lane < (blockDim.x + 31) / 32 ? reduction[lane] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      total += __shfl_down_sync(kFullWarpMask, total, offset);
+    }
+    if (lane == 0) {
+      reduction[0] = total;
+    }
+  }
+  __syncthreads();
   return reduction[0];
+}
+
+__device__ inline float qn_warp_sum(float value) {
+  constexpr unsigned kFullWarpMask = 0xffffffffu;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(kFullWarpMask, value, offset);
+  }
+  return value;
 }
 
 template <typename scalar_t>
@@ -408,6 +488,64 @@ __device__ inline float qn_key_square_partial(
   return sum;
 }
 
+template <typename scalar_t>
+__device__ inline float qn_key_square_partial_warp(
+    const scalar_t* key,
+    const scalar_t* rope_freqs,
+    int batch_idx,
+    int height,
+    int width,
+    int heads,
+    int dim,
+    int channels,
+    int y0,
+    int y1,
+    int x0,
+    int x1,
+    float w00,
+    float w01,
+    float w10,
+    float w11,
+    float pos_y,
+    float pos_x,
+    bool norm_before_rope) {
+  int lane = threadIdx.x & 31;
+  float sum = 0.0f;
+  if constexpr (std::is_same_v<scalar_t, at::Half>) {
+    if (norm_before_rope && (channels & 1) == 0) {
+      const __half2* p00 = reinterpret_cast<const __half2*>(
+          key + ((batch_idx * height + y0) * width + x0) * channels);
+      const __half2* p01 = reinterpret_cast<const __half2*>(
+          key + ((batch_idx * height + y0) * width + x1) * channels);
+      const __half2* p10 = reinterpret_cast<const __half2*>(
+          key + ((batch_idx * height + y1) * width + x0) * channels);
+      const __half2* p11 = reinterpret_cast<const __half2*>(
+          key + ((batch_idx * height + y1) * width + x1) * channels);
+      for (int c2 = lane; c2 < channels / 2; c2 += 32) {
+        float2 v00 = __half22float2(p00[c2]);
+        float2 v01 = __half22float2(p01[c2]);
+        float2 v10 = __half22float2(p10[c2]);
+        float2 v11 = __half22float2(p11[c2]);
+        float x = w00 * v00.x + w01 * v01.x + w10 * v10.x + w11 * v11.x;
+        float y = w00 * v00.y + w01 * v01.y + w10 * v10.y + w11 * v11.y;
+        sum += x * x + y * y;
+      }
+      return sum;
+    }
+  }
+  for (int c = lane; c < channels; c += 32) {
+    float x = norm_before_rope
+        ? qn_key_raw(
+              key, batch_idx, height, width, heads, dim, c,
+              y0, y1, x0, x1, w00, w01, w10, w11)
+        : qn_key_rope(
+              key, rope_freqs, batch_idx, height, width, heads, dim, channels, c,
+              y0, y1, x0, x1, w00, w01, w10, w11, pos_y, pos_x);
+    sum += x * x;
+  }
+  return sum;
+}
+
 template <typename scalar_t, typename coord_t>
 __global__ void qn_forward_kernel(
     const scalar_t* query,
@@ -483,18 +621,21 @@ __global__ void qn_forward_kernel(
   }
   __syncthreads();
 
-  for (int token = 0; token < tokens; ++token) {
-    float sum = qn_key_square_partial(
+  int warp = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  int warps = blockDim.x >> 5;
+  for (int token = warp; token < tokens; token += warps) {
+    float sum = qn_key_square_partial_warp(
         key, rope_freqs, batch_idx, height, width, heads, dim, channels,
         y0s[token], y1s[token], x0s[token], x1s[token],
         w00s[token], w01s[token], w10s[token], w11s[token],
         pos_ys[token], pos_xs[token], norm_before_rope);
-    float inv = rsqrtf(qn_block_sum(sum, reduction) / channels + norm_eps);
-    if (threadIdx.x == 0) {
-      k_inv[token] = inv;
+    sum = qn_warp_sum(sum);
+    if (lane == 0) {
+      k_inv[token] = rsqrtf(sum / channels + norm_eps);
     }
-    __syncthreads();
   }
+  __syncthreads();
 
   for (int index = threadIdx.x; index < heads * tokens; index += blockDim.x) {
     int head = index / tokens;
@@ -531,6 +672,29 @@ __global__ void qn_forward_kernel(
     logsumexp[(batch_idx * num_queries + query_idx) * heads + head] = logf(denom) + max_logit;
   }
   __syncthreads();
+
+  if constexpr (std::is_same_v<scalar_t, at::Half>) {
+    if ((dim_value & 1) == 0) {
+      __half2* out2 = reinterpret_cast<__half2*>(
+          out + (batch_idx * num_queries + query_idx) * heads * dim_value);
+      for (int c2 = threadIdx.x; c2 < heads * (dim_value / 2); c2 += blockDim.x) {
+        int head = c2 / (dim_value / 2);
+        int dv2 = c2 - head * (dim_value / 2);
+        float2 acc = make_float2(0.0f, 0.0f);
+        for (int token = 0; token < tokens; ++token) {
+          float2 v = qn_bilinear_load_half2(
+              value, batch_idx, height, width, heads, head, dim_value, dv2 * 2,
+              y0s[token], y1s[token], x0s[token], x1s[token],
+              w00s[token], w01s[token], w10s[token], w11s[token]);
+          float p = probs[head * tokens + token];
+          acc.x += p * v.x;
+          acc.y += p * v.y;
+        }
+        out2[c2] = __floats2half2_rn(acc.x, acc.y);
+      }
+      return;
+    }
+  }
 
   for (int c = threadIdx.x; c < heads * dim_value; c += blockDim.x) {
     int head = c / dim_value;
@@ -624,18 +788,21 @@ __global__ void qn_backward_value_kernel(
   }
   __syncthreads();
 
-  for (int token = 0; token < tokens; ++token) {
-    float sum = qn_key_square_partial(
+  int warp = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  int warps = blockDim.x >> 5;
+  for (int token = warp; token < tokens; token += warps) {
+    float sum = qn_key_square_partial_warp(
         key, rope_freqs, batch_idx, height, width, heads, dim, channels,
         y0s[token], y1s[token], x0s[token], x1s[token],
         w00s[token], w01s[token], w10s[token], w11s[token],
         pos_ys[token], pos_xs[token], norm_before_rope);
-    float inv = rsqrtf(qn_block_sum(sum, reduction) / channels + norm_eps);
-    if (threadIdx.x == 0) {
-      k_inv[token] = inv;
+    sum = qn_warp_sum(sum);
+    if (lane == 0) {
+      k_inv[token] = rsqrtf(sum / channels + norm_eps);
     }
-    __syncthreads();
   }
+  __syncthreads();
 
   for (int index = threadIdx.x; index < heads * tokens; index += blockDim.x) {
     int head = index / tokens;
@@ -654,25 +821,76 @@ __global__ void qn_backward_value_kernel(
   }
   __syncthreads();
 
-  for (int index = threadIdx.x; index < heads * tokens; index += blockDim.x) {
-    int head = index / tokens;
-    int token = index - head * tokens;
-    float dprob = 0.0f;
+  for (int head = threadIdx.x; head < heads; head += blockDim.x) {
     float delta = 0.0f;
     const scalar_t* go = grad_out + (((batch_idx * num_queries + query_idx) * heads + head) * dim_value);
     const scalar_t* o = out + (((batch_idx * num_queries + query_idx) * heads + head) * dim_value);
     for (int dv = 0; dv < dim_value; ++dv) {
-      float g = qn_load(go + dv);
-      delta += g * qn_load(o + dv);
-      dprob += g * qn_bilinear_load(
-          value, batch_idx, height, width, heads, head, dim_value, dv,
-          y0s[token], y1s[token], x0s[token], x1s[token],
-          w00s[token], w01s[token], w10s[token], w11s[token]);
+      delta += qn_load(go + dv) * qn_load(o + dv);
     }
-    d_logits[((batch_idx * num_queries + query_idx) * heads + head) * tokens + token] =
-        probs[index] * (dprob - delta) * attn_scale;
+    reduction[head] = delta;
   }
   __syncthreads();
+
+  for (int index = threadIdx.x; index < heads * tokens; index += blockDim.x) {
+    int head = index / tokens;
+    int token = index - head * tokens;
+    float dprob = 0.0f;
+    const scalar_t* go = grad_out + (((batch_idx * num_queries + query_idx) * heads + head) * dim_value);
+    if constexpr (std::is_same_v<scalar_t, at::Half>) {
+      if ((dim_value & 1) == 0) {
+        const __half2* go2 = reinterpret_cast<const __half2*>(go);
+        for (int dv2 = 0; dv2 < dim_value / 2; ++dv2) {
+          float2 g = __half22float2(go2[dv2]);
+          float2 v = qn_bilinear_load_half2(
+              value, batch_idx, height, width, heads, head, dim_value, dv2 * 2,
+              y0s[token], y1s[token], x0s[token], x1s[token],
+              w00s[token], w01s[token], w10s[token], w11s[token]);
+          dprob += g.x * v.x + g.y * v.y;
+        }
+      } else {
+        for (int dv = 0; dv < dim_value; ++dv) {
+          float g = qn_load(go + dv);
+          dprob += g * qn_bilinear_load(
+              value, batch_idx, height, width, heads, head, dim_value, dv,
+              y0s[token], y1s[token], x0s[token], x1s[token],
+              w00s[token], w01s[token], w10s[token], w11s[token]);
+        }
+      }
+    } else {
+      for (int dv = 0; dv < dim_value; ++dv) {
+        float g = qn_load(go + dv);
+        dprob += g * qn_bilinear_load(
+            value, batch_idx, height, width, heads, head, dim_value, dv,
+            y0s[token], y1s[token], x0s[token], x1s[token],
+            w00s[token], w01s[token], w10s[token], w11s[token]);
+      }
+    }
+    d_logits[((batch_idx * num_queries + query_idx) * heads + head) * tokens + token] =
+        probs[index] * (dprob - reduction[head]) * attn_scale;
+  }
+  __syncthreads();
+
+  if constexpr (std::is_same_v<scalar_t, at::Half>) {
+    if ((dim_value & 1) == 0) {
+      for (int c2 = threadIdx.x; c2 < heads * (dim_value / 2); c2 += blockDim.x) {
+        int head = c2 / (dim_value / 2);
+        int dv2 = c2 - head * (dim_value / 2);
+        const __half2* go = reinterpret_cast<const __half2*>(
+            grad_out + (((batch_idx * num_queries + query_idx) * heads + head) * dim_value));
+        float2 grad_pair = __half22float2(go[dv2]);
+        for (int token = 0; token < tokens; ++token) {
+          float p = probs[head * tokens + token];
+          qn_bilinear_atomic_add_half2(
+              grad_value, batch_idx, height, width, heads, head, dim_value, dv2 * 2,
+              y0s[token], y1s[token], x0s[token], x1s[token],
+              w00s[token], w01s[token], w10s[token], w11s[token],
+              make_float2(p * grad_pair.x, p * grad_pair.y));
+        }
+      }
+      return;
+    }
+  }
 
   int value_numel = batch * height * width * heads * dim_value;
   for (int c = threadIdx.x; c < heads * dim_value; c += blockDim.x) {
@@ -723,7 +941,10 @@ __global__ void qn_backward_query_key_kernel(
   float* k_inv = q_trans + channels;
   float* grad_stage = k_inv + tokens;
   float* grad_mid = grad_stage + channels;
-  float* w00s = grad_mid + channels;
+  float* k_weight_acc = grad_mid + channels;
+  float* rope_y_acc = k_weight_acc + channels;
+  float* rope_x_acc = rope_y_acc + channels;
+  float* w00s = rope_x_acc + channels;
   float* w01s = w00s + tokens;
   float* w10s = w01s + tokens;
   float* w11s = w10s + tokens;
@@ -743,6 +964,11 @@ __global__ void qn_backward_query_key_kernel(
   float q_pos_y = (coord_y + 1.0f) * 0.5f;
   float q_pos_x = (coord_x + 1.0f) * 0.5f;
 
+  for (int c = threadIdx.x; c < channels; c += blockDim.x) {
+    k_weight_acc[c] = 0.0f;
+    rope_y_acc[c] = 0.0f;
+    rope_x_acc[c] = 0.0f;
+  }
   for (int token = threadIdx.x; token < tokens; token += blockDim.x) {
     int oy = token / kernel_w - kernel_h / 2;
     int ox = token % kernel_w - kernel_w / 2;
@@ -767,18 +993,21 @@ __global__ void qn_backward_query_key_kernel(
   }
   __syncthreads();
 
-  for (int token = 0; token < tokens; ++token) {
-    float sum = qn_key_square_partial(
+  int warp = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  int warps = blockDim.x >> 5;
+  for (int token = warp; token < tokens; token += warps) {
+    float sum = qn_key_square_partial_warp(
         key, rope_freqs, batch_idx, height, width, heads, dim, channels,
         y0s[token], y1s[token], x0s[token], x1s[token],
         w00s[token], w01s[token], w10s[token], w11s[token],
         pos_ys[token], pos_xs[token], norm_before_rope);
-    float inv = rsqrtf(qn_block_sum(sum, reduction) / channels + norm_eps);
-    if (threadIdx.x == 0) {
-      k_inv[token] = inv;
+    sum = qn_warp_sum(sum);
+    if (lane == 0) {
+      k_inv[token] = rsqrtf(sum / channels + norm_eps);
     }
-    __syncthreads();
   }
+  __syncthreads();
 
   for (int c = threadIdx.x; c < channels; c += blockDim.x) {
     int head = c / dim;
@@ -813,8 +1042,8 @@ __global__ void qn_backward_query_key_kernel(
       float dangle = grad_stage[c] *
           (-n * sinf(angle) + qn_pair_sign(c, channels) * n_pair * cosf(angle));
       qn_atomic_add(grad_q_weight, c, channels, grad_norm * u);
-      qn_atomic_add(grad_rope_freqs, c, 2 * channels, dangle * q_pos_y);
-      qn_atomic_add(grad_rope_freqs, channels + c, 2 * channels, dangle * q_pos_x);
+      rope_y_acc[c] += dangle * q_pos_y;
+      rope_x_acc[c] += dangle * q_pos_x;
     }
     float correction = qn_block_sum(q_dot, reduction) / channels;
     for (int c = threadIdx.x; c < channels; c += blockDim.x) {
@@ -852,8 +1081,8 @@ __global__ void qn_backward_query_key_kernel(
       float dangle = grad_mid[c] *
           (-x * sinf(angle) + qn_pair_sign(c, channels) * x_pair * cosf(angle));
       grad_query[(batch_idx * num_queries + query_idx) * channels + c] = static_cast<scalar_t>(gx);
-      qn_atomic_add(grad_rope_freqs, c, 2 * channels, dangle * q_pos_y);
-      qn_atomic_add(grad_rope_freqs, channels + c, 2 * channels, dangle * q_pos_x);
+      rope_y_acc[c] += dangle * q_pos_y;
+      rope_x_acc[c] += dangle * q_pos_x;
     }
   }
   __syncthreads();
@@ -890,9 +1119,9 @@ __global__ void qn_backward_query_key_kernel(
             k_inv[token] * qn_load(k_weight + pair);
         float dangle = grad_stage[c] *
             (-n * sinf(angle) + qn_pair_sign(c, channels) * n_pair * cosf(angle));
-        qn_atomic_add(grad_k_weight, c, channels, grad_norm * u);
-        qn_atomic_add(grad_rope_freqs, c, 2 * channels, dangle * pos_ys[token]);
-        qn_atomic_add(grad_rope_freqs, channels + c, 2 * channels, dangle * pos_xs[token]);
+        k_weight_acc[c] += grad_norm * u;
+        rope_y_acc[c] += dangle * pos_ys[token];
+        rope_x_acc[c] += dangle * pos_xs[token];
       }
       float correction = qn_block_sum(k_dot, reduction) / channels;
       for (int c = threadIdx.x; c < channels; c += blockDim.x) {
@@ -918,7 +1147,7 @@ __global__ void qn_backward_query_key_kernel(
             pos_ys[token], pos_xs[token]);
         float u = r * k_inv[token];
         k_dot += grad_stage[c] * qn_load(k_weight + c) * u;
-        qn_atomic_add(grad_k_weight, c, channels, grad_stage[c] * u);
+        k_weight_acc[c] += grad_stage[c] * u;
       }
       float correction = qn_block_sum(k_dot, reduction) / channels;
       for (int c = threadIdx.x; c < channels; c += blockDim.x) {
@@ -953,11 +1182,16 @@ __global__ void qn_backward_query_key_kernel(
             grad_key, batch_idx, height, width, heads, head, dim, d,
             y0s[token], y1s[token], x0s[token], x1s[token],
             w00s[token], w01s[token], w10s[token], w11s[token], gx, key_numel);
-        qn_atomic_add(grad_rope_freqs, c, 2 * channels, dangle * pos_ys[token]);
-        qn_atomic_add(grad_rope_freqs, channels + c, 2 * channels, dangle * pos_xs[token]);
+        rope_y_acc[c] += dangle * pos_ys[token];
+        rope_x_acc[c] += dangle * pos_xs[token];
       }
     }
     __syncthreads();
+  }
+  for (int c = threadIdx.x; c < channels; c += blockDim.x) {
+    qn_atomic_add(grad_k_weight, c, channels, k_weight_acc[c]);
+    qn_atomic_add(grad_rope_freqs, c, 2 * channels, rope_y_acc[c]);
+    qn_atomic_add(grad_rope_freqs, channels + c, 2 * channels, rope_x_acc[c]);
   }
 }
 
@@ -1004,7 +1238,7 @@ size_t qn_forward_smem(int channels, int heads, int tokens) {
 }
 
 size_t qn_backward_qk_smem(int channels, int tokens) {
-  return (3 * channels + tokens + 6 * tokens + kQueryNeighborThreads) * sizeof(float) +
+  return (6 * channels + tokens + 6 * tokens + kQueryNeighborThreads) * sizeof(float) +
       4 * tokens * sizeof(int);
 }
 
