@@ -44,6 +44,24 @@ __device__ inline float qn_load(const scalar_t* ptr) {
   return static_cast<float>(*ptr);
 }
 
+template <typename scalar_t>
+__device__ inline float qn_bf16_round(float value) {
+  if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+    return static_cast<float>(static_cast<at::BFloat16>(value));
+  }
+  return value;
+}
+
+template <typename scalar_t>
+__device__ inline float qn_rope_cos(float angle) {
+  return qn_bf16_round<scalar_t>(cosf(angle));
+}
+
+template <typename scalar_t>
+__device__ inline float qn_rope_sin(float angle) {
+  return qn_bf16_round<scalar_t>(sinf(angle));
+}
+
 __device__ inline float qn_clamp(float x, float lo, float hi) {
   return fminf(fmaxf(x, lo), hi);
 }
@@ -272,8 +290,9 @@ __device__ inline float qn_key_raw(
 template <typename scalar_t>
 __device__ inline float qn_angle(
     const scalar_t* rope_freqs, int channels, int channel, float pos_y, float pos_x) {
-  return pos_y * qn_load(rope_freqs + channel) +
-      pos_x * qn_load(rope_freqs + channels + channel);
+  return qn_bf16_round<scalar_t>(
+      pos_y * qn_load(rope_freqs + channel) +
+      pos_x * qn_load(rope_freqs + channels + channel));
 }
 
 template <typename scalar_t>
@@ -289,9 +308,10 @@ __device__ inline float qn_query_rope(
     float pos_x) {
   int pair = qn_pair(channel, channels);
   float angle = qn_angle(rope_freqs, channels, channel, pos_y, pos_x);
-  return qn_query_raw(query, batch_idx, query_idx, num_queries, channels, channel) * cosf(angle) +
+  return qn_bf16_round<scalar_t>(
+      qn_query_raw(query, batch_idx, query_idx, num_queries, channels, channel) * qn_rope_cos<scalar_t>(angle) +
       qn_pair_sign(channel, channels) *
-      qn_query_raw(query, batch_idx, query_idx, num_queries, channels, pair) * sinf(angle);
+      qn_query_raw(query, batch_idx, query_idx, num_queries, channels, pair) * qn_rope_sin<scalar_t>(angle));
 }
 
 template <typename scalar_t>
@@ -319,11 +339,11 @@ __device__ inline float qn_key_rope(
   float angle = qn_angle(rope_freqs, channels, channel, pos_y, pos_x);
   return qn_key_raw(
              key, batch_idx, height, width, heads, dim, channel,
-             y0, y1, x0, x1, w00, w01, w10, w11) * cosf(angle) +
+             y0, y1, x0, x1, w00, w01, w10, w11) * qn_rope_cos<scalar_t>(angle) +
       qn_pair_sign(channel, channels) *
       qn_key_raw(
              key, batch_idx, height, width, heads, dim, pair,
-             y0, y1, x0, x1, w00, w01, w10, w11) * sinf(angle);
+             y0, y1, x0, x1, w00, w01, w10, w11) * qn_rope_sin<scalar_t>(angle);
 }
 
 template <typename scalar_t>
@@ -341,17 +361,21 @@ __device__ inline float qn_query_transformed(
     float inv_rms,
     bool norm_before_rope) {
   if (!norm_before_rope) {
-    return qn_query_rope(
+    return qn_bf16_round<scalar_t>(qn_query_rope(
                query, rope_freqs, batch_idx, query_idx, num_queries,
-               channels, channel, pos_y, pos_x) * inv_rms * qn_load(q_weight + channel);
+               channels, channel, pos_y, pos_x) * inv_rms * qn_load(q_weight + channel));
   }
   int pair = qn_pair(channel, channels);
   float angle = qn_angle(rope_freqs, channels, channel, pos_y, pos_x);
-  float own = qn_query_raw(query, batch_idx, query_idx, num_queries, channels, channel) *
-      inv_rms * qn_load(q_weight + channel);
-  float paired = qn_query_raw(query, batch_idx, query_idx, num_queries, channels, pair) *
-      inv_rms * qn_load(q_weight + pair);
-  return own * cosf(angle) + qn_pair_sign(channel, channels) * paired * sinf(angle);
+  float own = qn_bf16_round<scalar_t>(
+      qn_query_raw(query, batch_idx, query_idx, num_queries, channels, channel) *
+      inv_rms * qn_load(q_weight + channel));
+  float paired = qn_bf16_round<scalar_t>(
+      qn_query_raw(query, batch_idx, query_idx, num_queries, channels, pair) *
+      inv_rms * qn_load(q_weight + pair));
+  return qn_bf16_round<scalar_t>(
+      own * qn_rope_cos<scalar_t>(angle) +
+      qn_pair_sign(channel, channels) * paired * qn_rope_sin<scalar_t>(angle));
 }
 
 template <typename scalar_t>
@@ -394,7 +418,8 @@ __device__ inline float qn_key_transformed(
                      key, batch_idx, height, width, heads, dim, pair,
                      y0, y1, x0, x1, w00, w01, w10, w11) *
       inv_rms * qn_load(k_weight + pair);
-  return own * cosf(angle) + qn_pair_sign(channel, channels) * paired * sinf(angle);
+  return own * qn_rope_cos<scalar_t>(angle) +
+      qn_pair_sign(channel, channels) * paired * qn_rope_sin<scalar_t>(angle);
 }
 
 template <typename scalar_t>
@@ -648,9 +673,9 @@ __global__ void qn_forward_kernel(
           y0s[token], y1s[token], x0s[token], x1s[token],
           w00s[token], w01s[token], w10s[token], w11s[token],
           pos_ys[token], pos_xs[token], k_inv[token], norm_before_rope);
-      logit += q_trans[c] * kval;
+      logit += qn_bf16_round<scalar_t>(q_trans[c]) * qn_bf16_round<scalar_t>(kval);
     }
-    probs[index] = logit * attn_scale;
+    probs[index] = qn_bf16_round<scalar_t>(logit * attn_scale);
   }
   __syncthreads();
 
@@ -701,10 +726,12 @@ __global__ void qn_forward_kernel(
     int dv = c - head * dim_value;
     float acc = 0.0f;
     for (int token = 0; token < tokens; ++token) {
-      acc += probs[head * tokens + token] * qn_bilinear_load(
+      float p = qn_bf16_round<scalar_t>(probs[head * tokens + token]);
+      float v = qn_bf16_round<scalar_t>(qn_bilinear_load(
           value, batch_idx, height, width, heads, head, dim_value, dv,
           y0s[token], y1s[token], x0s[token], x1s[token],
-          w00s[token], w01s[token], w10s[token], w11s[token]);
+          w00s[token], w01s[token], w10s[token], w11s[token]));
+      acc += p * v;
     }
     out[(batch_idx * num_queries + query_idx) * heads * dim_value + c] = static_cast<scalar_t>(acc);
   }
@@ -810,25 +837,15 @@ __global__ void qn_backward_value_kernel(
     float logit = 0.0f;
     for (int d = 0; d < dim; ++d) {
       int c = head * dim + d;
-      logit += q_trans[c] * qn_key_transformed(
+      float kval = qn_key_transformed(
           key, k_weight, rope_freqs, batch_idx, height, width, heads, dim, channels, c,
           y0s[token], y1s[token], x0s[token], x1s[token],
           w00s[token], w01s[token], w10s[token], w11s[token],
           pos_ys[token], pos_xs[token], k_inv[token], norm_before_rope);
+      logit += qn_bf16_round<scalar_t>(q_trans[c]) * qn_bf16_round<scalar_t>(kval);
     }
     float lse = logsumexp[(batch_idx * num_queries + query_idx) * heads + head];
-    probs[index] = expf(logit * attn_scale - lse);
-  }
-  __syncthreads();
-
-  for (int head = threadIdx.x; head < heads; head += blockDim.x) {
-    float delta = 0.0f;
-    const scalar_t* go = grad_out + (((batch_idx * num_queries + query_idx) * heads + head) * dim_value);
-    const scalar_t* o = out + (((batch_idx * num_queries + query_idx) * heads + head) * dim_value);
-    for (int dv = 0; dv < dim_value; ++dv) {
-      delta += qn_load(go + dv) * qn_load(o + dv);
-    }
-    reduction[head] = delta;
+    probs[index] = expf(qn_bf16_round<scalar_t>(logit * attn_scale) - lse);
   }
   __syncthreads();
 
@@ -860,14 +877,36 @@ __global__ void qn_backward_value_kernel(
     } else {
       for (int dv = 0; dv < dim_value; ++dv) {
         float g = qn_load(go + dv);
-        dprob += g * qn_bilinear_load(
+        float v = qn_bf16_round<scalar_t>(qn_bilinear_load(
             value, batch_idx, height, width, heads, head, dim_value, dv,
             y0s[token], y1s[token], x0s[token], x1s[token],
-            w00s[token], w01s[token], w10s[token], w11s[token]);
+            w00s[token], w01s[token], w10s[token], w11s[token]));
+        dprob += g * v;
       }
     }
     d_logits[((batch_idx * num_queries + query_idx) * heads + head) * tokens + token] =
-        probs[index] * (dprob - reduction[head]) * attn_scale;
+        qn_bf16_round<scalar_t>(dprob);
+  }
+  __syncthreads();
+
+  for (int head = threadIdx.x; head < heads; head += blockDim.x) {
+    float delta = 0.0f;
+    const float* head_dprobs =
+        d_logits + ((batch_idx * num_queries + query_idx) * heads + head) * tokens;
+    for (int token = 0; token < tokens; ++token) {
+      delta += probs[head * tokens + token] * head_dprobs[token];
+    }
+    reduction[head] = delta;
+  }
+  __syncthreads();
+
+  for (int index = threadIdx.x; index < heads * tokens; index += blockDim.x) {
+    int head = index / tokens;
+    int token = index - head * tokens;
+    int offset = ((batch_idx * num_queries + query_idx) * heads + head) * tokens + token;
+    float dprob = d_logits[offset];
+    d_logits[offset] = qn_bf16_round<scalar_t>(
+        probs[index] * (dprob - reduction[head]) * attn_scale);
   }
   __syncthreads();
 
@@ -899,11 +938,12 @@ __global__ void qn_backward_value_kernel(
     float go = qn_load(
         grad_out + (((batch_idx * num_queries + query_idx) * heads + head) * dim_value + dv));
     for (int token = 0; token < tokens; ++token) {
+      float p = qn_bf16_round<scalar_t>(probs[head * tokens + token]);
       qn_bilinear_atomic_add(
           grad_value, batch_idx, height, width, heads, head, dim_value, dv,
           y0s[token], y1s[token], x0s[token], x1s[token],
           w00s[token], w01s[token], w10s[token], w11s[token],
-          probs[head * tokens + token] * go, value_numel);
+          p * go, value_numel);
     }
   }
 }
@@ -919,9 +959,9 @@ __global__ void qn_backward_query_key_kernel(
     const float* d_logits,
     scalar_t* grad_query,
     scalar_t* grad_key,
-    scalar_t* grad_q_weight,
-    scalar_t* grad_k_weight,
-    scalar_t* grad_rope_freqs,
+    float* grad_q_weight,
+    float* grad_k_weight,
+    float* grad_rope_freqs,
     int batch,
     int num_queries,
     int height,
@@ -1014,13 +1054,14 @@ __global__ void qn_backward_query_key_kernel(
     float acc = 0.0f;
     for (int token = 0; token < tokens; ++token) {
       float dl = d_logits[((batch_idx * num_queries + query_idx) * heads + head) * tokens + token];
-      acc += dl * qn_key_transformed(
+      float kval = qn_key_transformed(
           key, k_weight, rope_freqs, batch_idx, height, width, heads, dim, channels, c,
           y0s[token], y1s[token], x0s[token], x1s[token],
           w00s[token], w01s[token], w10s[token], w11s[token],
           pos_ys[token], pos_xs[token], k_inv[token], norm_before_rope);
+      acc += dl * qn_bf16_round<scalar_t>(kval);
     }
-    grad_stage[c] = acc;
+    grad_stage[c] = qn_bf16_round<scalar_t>(acc);
   }
   __syncthreads();
 
@@ -1030,8 +1071,8 @@ __global__ void qn_backward_query_key_kernel(
       int pair = qn_pair(c, channels);
       float angle = qn_angle(rope_freqs, channels, c, q_pos_y, q_pos_x);
       float pair_angle = qn_angle(rope_freqs, channels, pair, q_pos_y, q_pos_x);
-      float grad_norm = grad_stage[c] * cosf(angle) +
-          grad_stage[pair] * qn_pair_sign(pair, channels) * sinf(pair_angle);
+      float grad_norm = grad_stage[c] * qn_rope_cos<scalar_t>(angle) +
+          grad_stage[pair] * qn_pair_sign(pair, channels) * qn_rope_sin<scalar_t>(pair_angle);
       grad_mid[c] = grad_norm;
       float x = qn_query_raw(query, batch_idx, query_idx, num_queries, channels, c);
       float u = x * q_inv;
@@ -1040,7 +1081,8 @@ __global__ void qn_backward_query_key_kernel(
       float n_pair = qn_query_raw(query, batch_idx, query_idx, num_queries, channels, pair) *
           q_inv * qn_load(q_weight + pair);
       float dangle = grad_stage[c] *
-          (-n * sinf(angle) + qn_pair_sign(c, channels) * n_pair * cosf(angle));
+          (-n * qn_rope_sin<scalar_t>(angle) +
+           qn_pair_sign(c, channels) * n_pair * qn_rope_cos<scalar_t>(angle));
       qn_atomic_add(grad_q_weight, c, channels, grad_norm * u);
       rope_y_acc[c] += dangle * q_pos_y;
       rope_x_acc[c] += dangle * q_pos_x;
@@ -1074,12 +1116,13 @@ __global__ void qn_backward_query_key_kernel(
       int pair = qn_pair(c, channels);
       float angle = qn_angle(rope_freqs, channels, c, q_pos_y, q_pos_x);
       float pair_angle = qn_angle(rope_freqs, channels, pair, q_pos_y, q_pos_x);
-      float gx = grad_mid[c] * cosf(angle) +
-          grad_mid[pair] * qn_pair_sign(pair, channels) * sinf(pair_angle);
+      float gx = grad_mid[c] * qn_rope_cos<scalar_t>(angle) +
+          grad_mid[pair] * qn_pair_sign(pair, channels) * qn_rope_sin<scalar_t>(pair_angle);
       float x = qn_query_raw(query, batch_idx, query_idx, num_queries, channels, c);
       float x_pair = qn_query_raw(query, batch_idx, query_idx, num_queries, channels, pair);
       float dangle = grad_mid[c] *
-          (-x * sinf(angle) + qn_pair_sign(c, channels) * x_pair * cosf(angle));
+          (-x * qn_rope_sin<scalar_t>(angle) +
+           qn_pair_sign(c, channels) * x_pair * qn_rope_cos<scalar_t>(angle));
       grad_query[(batch_idx * num_queries + query_idx) * channels + c] = static_cast<scalar_t>(gx);
       rope_y_acc[c] += dangle * q_pos_y;
       rope_x_acc[c] += dangle * q_pos_x;
@@ -1092,7 +1135,7 @@ __global__ void qn_backward_query_key_kernel(
     for (int c = threadIdx.x; c < channels; c += blockDim.x) {
       int head = c / dim;
       float dl = d_logits[((batch_idx * num_queries + query_idx) * heads + head) * tokens + token];
-      grad_stage[c] = dl * q_trans[c];
+      grad_stage[c] = qn_bf16_round<scalar_t>(dl * qn_bf16_round<scalar_t>(q_trans[c]));
     }
     __syncthreads();
 
@@ -1102,8 +1145,8 @@ __global__ void qn_backward_query_key_kernel(
         int pair = qn_pair(c, channels);
         float angle = qn_angle(rope_freqs, channels, c, pos_ys[token], pos_xs[token]);
         float pair_angle = qn_angle(rope_freqs, channels, pair, pos_ys[token], pos_xs[token]);
-        float grad_norm = grad_stage[c] * cosf(angle) +
-            grad_stage[pair] * qn_pair_sign(pair, channels) * sinf(pair_angle);
+        float grad_norm = grad_stage[c] * qn_rope_cos<scalar_t>(angle) +
+            grad_stage[pair] * qn_pair_sign(pair, channels) * qn_rope_sin<scalar_t>(pair_angle);
         grad_mid[c] = grad_norm;
         float x = qn_key_raw(
             key, batch_idx, height, width, heads, dim, c,
@@ -1118,7 +1161,8 @@ __global__ void qn_backward_query_key_kernel(
             w00s[token], w01s[token], w10s[token], w11s[token]) *
             k_inv[token] * qn_load(k_weight + pair);
         float dangle = grad_stage[c] *
-            (-n * sinf(angle) + qn_pair_sign(c, channels) * n_pair * cosf(angle));
+            (-n * qn_rope_sin<scalar_t>(angle) +
+             qn_pair_sign(c, channels) * n_pair * qn_rope_cos<scalar_t>(angle));
         k_weight_acc[c] += grad_norm * u;
         rope_y_acc[c] += dangle * pos_ys[token];
         rope_x_acc[c] += dangle * pos_xs[token];
@@ -1166,8 +1210,8 @@ __global__ void qn_backward_query_key_kernel(
         int d = c - head * dim;
         float angle = qn_angle(rope_freqs, channels, c, pos_ys[token], pos_xs[token]);
         float pair_angle = qn_angle(rope_freqs, channels, pair, pos_ys[token], pos_xs[token]);
-        float gx = grad_mid[c] * cosf(angle) +
-            grad_mid[pair] * qn_pair_sign(pair, channels) * sinf(pair_angle);
+        float gx = grad_mid[c] * qn_rope_cos<scalar_t>(angle) +
+            grad_mid[pair] * qn_pair_sign(pair, channels) * qn_rope_sin<scalar_t>(pair_angle);
         float x = qn_key_raw(
             key, batch_idx, height, width, heads, dim, c,
             y0s[token], y1s[token], x0s[token], x1s[token],
@@ -1177,7 +1221,8 @@ __global__ void qn_backward_query_key_kernel(
             y0s[token], y1s[token], x0s[token], x1s[token],
             w00s[token], w01s[token], w10s[token], w11s[token]);
         float dangle = grad_mid[c] *
-            (-x * sinf(angle) + qn_pair_sign(c, channels) * x_pair * cosf(angle));
+            (-x * qn_rope_sin<scalar_t>(angle) +
+             qn_pair_sign(c, channels) * x_pair * qn_rope_cos<scalar_t>(angle));
         qn_bilinear_atomic_add(
             grad_key, batch_idx, height, width, heads, head, dim, d,
             y0s[token], y1s[token], x0s[token], x1s[token],
@@ -1311,14 +1356,14 @@ void sparse_na2d_bilinear_query_neighbor_backward(
   check_qn_args(query, key, value, coords, q_weight, k_weight, rope_freqs, kernel_size);
   grad_key.zero_();
   grad_value.zero_();
-  grad_q_weight.zero_();
-  grad_k_weight.zero_();
-  grad_rope_freqs.zero_();
   at::cuda::OptionalCUDAGuard guard(query.device());
   int batch = query.size(0), num_queries = query.size(1), heads = query.size(2), dim = query.size(3);
   int height = key.size(1), width = key.size(2), dim_value = value.size(4);
   int kh = std::get<0>(kernel_size), kw = std::get<1>(kernel_size), tokens = kh * kw;
   at::Tensor d_logits = at::empty({batch, num_queries, heads, tokens}, query.options().dtype(at::kFloat));
+  at::Tensor grad_q_weight_acc = at::zeros(q_weight.sizes(), query.options().dtype(at::kFloat));
+  at::Tensor grad_k_weight_acc = at::zeros(k_weight.sizes(), query.options().dtype(at::kFloat));
+  at::Tensor grad_rope_freqs_acc = at::zeros(rope_freqs.sizes(), query.options().dtype(at::kFloat));
   dim3 grid(num_queries, batch);
   auto stream = at::cuda::getCurrentCUDAStream(query.device().index());
   size_t value_smem = qn_forward_smem(heads * dim, heads, tokens);
@@ -1339,13 +1384,16 @@ void sparse_na2d_bilinear_query_neighbor_backward(
               qn_backward_query_key_kernel<q_t, c_t><<<grid, kQueryNeighborThreads, qk_smem, stream>>>(
                   query.data_ptr<q_t>(), key.data_ptr<q_t>(), coords.data_ptr<c_t>(), q_weight.data_ptr<q_t>(),
                   k_weight.data_ptr<q_t>(), rope_freqs.data_ptr<q_t>(), d_logits.data_ptr<float>(),
-                  grad_query.data_ptr<q_t>(), grad_key.data_ptr<q_t>(), grad_q_weight.data_ptr<q_t>(),
-                  grad_k_weight.data_ptr<q_t>(), grad_rope_freqs.data_ptr<q_t>(), batch, num_queries,
+                  grad_query.data_ptr<q_t>(), grad_key.data_ptr<q_t>(), grad_q_weight_acc.data_ptr<float>(),
+                  grad_k_weight_acc.data_ptr<float>(), grad_rope_freqs_acc.data_ptr<float>(), batch, num_queries,
                   height, width, heads, dim, kh, kw, offset_scale_y, offset_scale_x, norm_eps,
                   norm_before_rope);
             });
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  grad_q_weight.copy_(grad_q_weight_acc);
+  grad_k_weight.copy_(grad_k_weight_acc);
+  grad_rope_freqs.copy_(grad_rope_freqs_acc);
 }
 
 } // namespace natten

@@ -616,7 +616,22 @@ def sparse_na2d_bilinear_query_neighbor(
     ``query_resolution=(Hq, Wq)`` uses steps ``(2 / Hq, 2 / Wq)``; direct
     ``offset_scale=(step_y, step_x)`` is also supported. Sampling follows
     ``grid_sample`` border behavior with ``align_corners=False``.
+
+    BF16 queries use an FP32 compatibility path internally. This matches the
+    materialized autocast path, where CUDA ``grid_sample`` promotes dense key
+    and value maps to FP32, while returning a BF16 attention output.
     """
+    output_dtype = query.dtype
+    bf16_compat = output_dtype == torch.bfloat16
+    if bf16_compat:
+        if key.dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError(f"BF16 compatibility requires BF16 or FP32 key, got {key.dtype}.")
+        if value.dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError(f"BF16 compatibility requires BF16 or FP32 value, got {value.dtype}.")
+        query = query.float()
+        key = key.float()
+        value = value.float()
+
     kernel_size = _check_sparse_na2d_inputs(
         query,
         key,
@@ -677,6 +692,8 @@ def sparse_na2d_bilinear_query_neighbor(
         qk_norm_eps,
         qk_norm_before_rope,
     )
+    if bf16_compat:
+        output = output.to(dtype=output_dtype)
     return (output, lse) if return_lse else output
 
 

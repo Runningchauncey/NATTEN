@@ -27,6 +27,7 @@ import torch
 import natten
 from natten._environment import _IS_CUDA_AVAILABLE, HAS_LIBNATTEN
 from natten.sparse_na2d_reference import (
+    rotate_half,
     sparse_na2d_bilinear_query_neighbor_pytorch,
     sparse_na2d_pytorch,
 )
@@ -663,6 +664,80 @@ def test_sparse_na2d_bilinear_query_neighbor_low_precision(dtype, qk_norm_before
     torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
     for actual_grad, reference_tensor in zip(actual_grads, refs):
         torch.testing.assert_close(actual_grad, reference_tensor.grad, rtol=0.12, atol=0.12)
+
+
+def test_sparse_na2d_bilinear_query_neighbor_bf16_autocast_matches_materialized():
+    torch.manual_seed(14)
+    batch, num_queries, height, width, heads, dim, dim_value = 1, 31, 6, 5, 4, 8, 16
+    kernel_size = (5, 3)
+    query_resolution = (19, 11)
+    query = torch.randn(
+        batch, num_queries, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    key = torch.randn(batch, height, width, heads, dim, device="cuda", requires_grad=True)
+    value = torch.randn(batch, height, width, heads, dim_value, device="cuda", requires_grad=True)
+    coords = torch.rand(batch, num_queries, 2, device="cuda") * 2 - 1
+    coords[:, :2] = torch.tensor([[-1.0, -1.0], [1.0, 1.0]], device="cuda")
+    q_weight = torch.randn(heads * dim, device="cuda", requires_grad=True)
+    k_weight = torch.randn(heads * dim, device="cuda", requires_grad=True)
+    rope_freqs = torch.randn(2, heads * dim, device="cuda", requires_grad=True)
+    inputs = (query, key, value, q_weight, k_weight, rope_freqs)
+
+    def materialized(q, k, v, qw, kw, rf):
+        kh, kernel_w = kernel_size
+        oy = torch.arange(-(kh // 2), kh // 2 + 1, device="cuda", dtype=coords.dtype)
+        ox = torch.arange(-(kernel_w // 2), kernel_w // 2 + 1, device="cuda", dtype=coords.dtype)
+        yy, xx = torch.meshgrid(oy, ox, indexing="ij")
+        sample_y = (coords[..., 0, None] + yy.flatten() * (2 / query_resolution[0])).clamp(-1, 1)
+        sample_x = (coords[..., 1, None] + xx.flatten() * (2 / query_resolution[1])).clamp(-1, 1)
+        grid = torch.stack((sample_x, sample_y), dim=-1)
+        key_map = k.permute(0, 3, 4, 1, 2).reshape(batch, heads * dim, height, width)
+        value_map = v.permute(0, 3, 4, 1, 2).reshape(batch, heads * dim_value, height, width)
+        local = torch.nn.functional.grid_sample(
+            torch.cat((key_map, value_map), dim=1),
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        ).permute(0, 2, 3, 1)
+        key_local, value_local = local.split((heads * dim, heads * dim_value), dim=-1)
+        q_full = q.reshape(batch, num_queries, heads * dim)
+        q_full = torch.nn.functional.rms_norm(q_full, (heads * dim,), qw.to(q.dtype), None)
+        key_local = torch.nn.functional.rms_norm(key_local, (heads * dim,), kw.to(key_local.dtype), None)
+        q_pos = (coords + 1) * 0.5
+        key_pos = torch.stack(((sample_y + 1) * 0.5, (sample_x + 1) * 0.5), dim=-1)
+
+        def rope(x, pos):
+            angle = pos @ rf
+            return x * angle.cos() + rotate_half(x) * angle.sin()
+
+        q_heads = rope(q_full, q_pos).reshape(batch, num_queries, heads, dim)
+        key_heads = rope(key_local, key_pos).reshape(batch, num_queries, kh * kernel_w, heads, dim)
+        logits = torch.einsum("bnhd,bnkhd->bnhk", q_heads, key_heads) * (dim**-0.5)
+        probs = logits.softmax(dim=-1)
+        value_heads = value_local.reshape(batch, num_queries, kh * kernel_w, heads, dim_value)
+        return torch.einsum("bnhk,bnkhd->bnhd", probs, value_heads)
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        actual = natten.sparse_na2d_bilinear_query_neighbor(
+            query, key, value, coords, kernel_size, q_weight, k_weight, rope_freqs,
+            query_resolution=query_resolution,
+        )
+        expected = materialized(*inputs)
+    assert actual.dtype == torch.bfloat16
+    grad = torch.randn_like(expected)
+    actual.backward(grad)
+    actual_grads = [tensor.grad.detach().clone() for tensor in inputs]
+    for tensor in inputs:
+        tensor.grad = None
+    expected.backward(grad)
+
+    def relative_l2(lhs, rhs):
+        return (lhs.float() - rhs.float()).norm() / rhs.float().norm().clamp_min(1e-12)
+
+    assert relative_l2(actual, expected) < 0.015
+    for actual_grad, reference_tensor in zip(actual_grads, inputs):
+        assert relative_l2(actual_grad, reference_tensor.grad) < 0.02
 
 
 def test_sparse_na2d_bilinear_query_neighbor_resolution_matches_offset_scale():
