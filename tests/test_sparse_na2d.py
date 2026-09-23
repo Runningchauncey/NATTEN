@@ -758,3 +758,20 @@ def test_sparse_na2d_bilinear_query_neighbor_resolution_matches_offset_scale():
         offset_scale=(2 / 11, 2 / 13),
     )
     torch.testing.assert_close(from_resolution, from_scale, rtol=0, atol=0)
+
+
+def test_sparse_na2d_bilinear_query_neighbor_default_qk_norm_eps():
+    torch.manual_seed(15)
+    query = (torch.randn(1, 4, 2, 8, device="cuda") * 1e-4).bfloat16()
+    key = (torch.randn(1, 5, 7, 2, 8, device="cuda") * 1e-4).bfloat16()
+    value = torch.randn(1, 5, 7, 2, 6, device="cuda").bfloat16()
+    coords = torch.rand(1, 4, 2, device="cuda") * 2 - 1
+    q_weight = torch.randn(16, device="cuda")
+    k_weight = torch.randn(16, device="cuda")
+    rope_freqs = torch.randn(2, 16, device="cuda")
+    args = (query, key, value, coords, (3, 3), q_weight, k_weight, rope_freqs)
+
+    default = natten.sparse_na2d_bilinear_query_neighbor(*args)
+    explicit = natten.sparse_na2d_bilinear_query_neighbor(*args, qk_norm_eps=1e-5)
+
+    torch.testing.assert_close(default, explicit, rtol=0, atol=0)

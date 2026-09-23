@@ -606,7 +606,7 @@ def sparse_na2d_bilinear_query_neighbor(
     query_resolution: Optional[Tuple[int, int]] = None,
     offset_scale: Optional[Tuple[float, float]] = None,
     scale: Optional[float] = None,
-    qk_norm_eps: Optional[float] = None,
+    qk_norm_eps: Optional[float] = 1e-5,
     qk_norm_before_rope: bool = True,
     return_lse: bool = False,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
@@ -620,6 +620,7 @@ def sparse_na2d_bilinear_query_neighbor(
     BF16 queries use an FP32 compatibility path internally. This matches the
     materialized autocast path, where CUDA ``grid_sample`` promotes dense key
     and value maps to FP32, while returning a BF16 attention output.
+    RMSNorm uses ``qk_norm_eps=1e-5`` by default for dtype-independent behavior.
     """
     output_dtype = query.dtype
     bf16_compat = output_dtype == torch.bfloat16

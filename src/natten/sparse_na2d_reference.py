@@ -337,7 +337,7 @@ def sparse_na2d_bilinear_query_neighbor_pytorch(
     query_resolution: Optional[Tuple[int, int]] = None,
     offset_scale: Optional[Tuple[float, float]] = None,
     scale: Optional[float] = None,
-    qk_norm_eps: Optional[float] = None,
+    qk_norm_eps: Optional[float] = 1e-5,
     qk_norm_before_rope: bool = True,
     return_lse: bool = False,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
