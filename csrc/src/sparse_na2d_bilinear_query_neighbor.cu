@@ -104,6 +104,47 @@ __device__ inline void qn_bilinear_metadata(
   w11 = wy1 * wx1;
 }
 
+__device__ inline void qn_neighborhood_metadata(
+    float coord_y,
+    float coord_x,
+    int offset_y,
+    int offset_x,
+    int height,
+    int width,
+    float offset_scale_y,
+    float offset_scale_x,
+    bool key_resolution,
+    float& pos_y,
+    float& pos_x,
+    int& y0,
+    int& y1,
+    int& x0,
+    int& x1,
+    float& w00,
+    float& w01,
+    float& w10,
+    float& w11) {
+  float sample_y;
+  float sample_x;
+  if (key_resolution) {
+    float center_y = qn_clamp((coord_y + 1.0f) * 0.5f * height - 0.5f, 0.0f, height - 1.0f);
+    float center_x = qn_clamp((coord_x + 1.0f) * 0.5f * width - 0.5f, 0.0f, width - 1.0f);
+    float pixel_y = qn_clamp(center_y + static_cast<float>(offset_y), 0.0f, height - 1.0f);
+    float pixel_x = qn_clamp(center_x + static_cast<float>(offset_x), 0.0f, width - 1.0f);
+    sample_y = (pixel_y + 0.5f) * (2.0f / height) - 1.0f;
+    sample_x = (pixel_x + 0.5f) * (2.0f / width) - 1.0f;
+    pos_y = height > 1 ? pixel_y / (height - 1.0f) : 0.0f;
+    pos_x = width > 1 ? pixel_x / (width - 1.0f) : 0.0f;
+  } else {
+    sample_y = qn_clamp(coord_y + offset_y * offset_scale_y, -1.0f, 1.0f);
+    sample_x = qn_clamp(coord_x + offset_x * offset_scale_x, -1.0f, 1.0f);
+    pos_y = (sample_y + 1.0f) * 0.5f;
+    pos_x = (sample_x + 1.0f) * 0.5f;
+  }
+  qn_bilinear_metadata(
+      sample_y, sample_x, height, width, y0, y1, x0, x1, w00, w01, w10, w11);
+}
+
 template <typename scalar_t>
 __device__ inline float qn_bilinear_load(
     const scalar_t* tensor,
@@ -593,6 +634,7 @@ __global__ void qn_forward_kernel(
     int kernel_w,
     float offset_scale_y,
     float offset_scale_x,
+    bool key_resolution,
     float attn_scale,
     float norm_eps,
     bool norm_before_rope) {
@@ -625,12 +667,10 @@ __global__ void qn_forward_kernel(
   for (int token = threadIdx.x; token < tokens; token += blockDim.x) {
     int oy = token / kernel_w - kernel_h / 2;
     int ox = token % kernel_w - kernel_w / 2;
-    float sy = qn_clamp(coord_y + oy * offset_scale_y, -1.0f, 1.0f);
-    float sx = qn_clamp(coord_x + ox * offset_scale_x, -1.0f, 1.0f);
-    pos_ys[token] = (sy + 1.0f) * 0.5f;
-    pos_xs[token] = (sx + 1.0f) * 0.5f;
-    qn_bilinear_metadata(
-        sy, sx, height, width, y0s[token], y1s[token], x0s[token], x1s[token],
+    qn_neighborhood_metadata(
+        coord_y, coord_x, oy, ox, height, width, offset_scale_y, offset_scale_x,
+        key_resolution, pos_ys[token], pos_xs[token],
+        y0s[token], y1s[token], x0s[token], x1s[token],
         w00s[token], w01s[token], w10s[token], w11s[token]);
   }
   __syncthreads();
@@ -762,6 +802,7 @@ __global__ void qn_backward_value_kernel(
     int kernel_w,
     float offset_scale_y,
     float offset_scale_x,
+    bool key_resolution,
     float attn_scale,
     float norm_eps,
     bool norm_before_rope) {
@@ -794,12 +835,10 @@ __global__ void qn_backward_value_kernel(
   for (int token = threadIdx.x; token < tokens; token += blockDim.x) {
     int oy = token / kernel_w - kernel_h / 2;
     int ox = token % kernel_w - kernel_w / 2;
-    float sy = qn_clamp(coord_y + oy * offset_scale_y, -1.0f, 1.0f);
-    float sx = qn_clamp(coord_x + ox * offset_scale_x, -1.0f, 1.0f);
-    pos_ys[token] = (sy + 1.0f) * 0.5f;
-    pos_xs[token] = (sx + 1.0f) * 0.5f;
-    qn_bilinear_metadata(
-        sy, sx, height, width, y0s[token], y1s[token], x0s[token], x1s[token],
+    qn_neighborhood_metadata(
+        coord_y, coord_x, oy, ox, height, width, offset_scale_y, offset_scale_x,
+        key_resolution, pos_ys[token], pos_xs[token],
+        y0s[token], y1s[token], x0s[token], x1s[token],
         w00s[token], w01s[token], w10s[token], w11s[token]);
   }
   __syncthreads();
@@ -972,6 +1011,7 @@ __global__ void qn_backward_query_key_kernel(
     int kernel_w,
     float offset_scale_y,
     float offset_scale_x,
+    bool key_resolution,
     float norm_eps,
     bool norm_before_rope) {
   extern __shared__ unsigned char shared_raw[];
@@ -1012,12 +1052,10 @@ __global__ void qn_backward_query_key_kernel(
   for (int token = threadIdx.x; token < tokens; token += blockDim.x) {
     int oy = token / kernel_w - kernel_h / 2;
     int ox = token % kernel_w - kernel_w / 2;
-    float sy = qn_clamp(coord_y + oy * offset_scale_y, -1.0f, 1.0f);
-    float sx = qn_clamp(coord_x + ox * offset_scale_x, -1.0f, 1.0f);
-    pos_ys[token] = (sy + 1.0f) * 0.5f;
-    pos_xs[token] = (sx + 1.0f) * 0.5f;
-    qn_bilinear_metadata(
-        sy, sx, height, width, y0s[token], y1s[token], x0s[token], x1s[token],
+    qn_neighborhood_metadata(
+        coord_y, coord_x, oy, ox, height, width, offset_scale_y, offset_scale_x,
+        key_resolution, pos_ys[token], pos_xs[token],
+        y0s[token], y1s[token], x0s[token], x1s[token],
         w00s[token], w01s[token], w10s[token], w11s[token]);
   }
   __syncthreads();
@@ -1302,6 +1340,7 @@ void sparse_na2d_bilinear_query_neighbor_forward(
     const std::tuple<int32_t, int32_t>& kernel_size,
     float offset_scale_y,
     float offset_scale_x,
+    bool key_resolution,
     float attn_scale,
     float norm_eps,
     bool norm_before_rope) {
@@ -1323,8 +1362,8 @@ void sparse_na2d_bilinear_query_neighbor_forward(
                   query.data_ptr<q_t>(), key.data_ptr<q_t>(), value.data_ptr<q_t>(), coords.data_ptr<c_t>(),
                   q_weight.data_ptr<q_t>(), k_weight.data_ptr<q_t>(), rope_freqs.data_ptr<q_t>(),
                   out.data_ptr<q_t>(), logsumexp.data_ptr<float>(), batch, num_queries, height, width,
-                  heads, dim, dim_value, kh, kw, offset_scale_y, offset_scale_x, attn_scale, norm_eps,
-                  norm_before_rope);
+                  heads, dim, dim_value, kh, kw, offset_scale_y, offset_scale_x, key_resolution,
+                  attn_scale, norm_eps, norm_before_rope);
             });
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1350,6 +1389,7 @@ void sparse_na2d_bilinear_query_neighbor_backward(
     const std::tuple<int32_t, int32_t>& kernel_size,
     float offset_scale_y,
     float offset_scale_x,
+    bool key_resolution,
     float attn_scale,
     float norm_eps,
     bool norm_before_rope) {
@@ -1379,14 +1419,14 @@ void sparse_na2d_bilinear_query_neighbor_backward(
                   q_weight.data_ptr<q_t>(), k_weight.data_ptr<q_t>(), rope_freqs.data_ptr<q_t>(),
                   out.data_ptr<q_t>(), grad_out.data_ptr<q_t>(), logsumexp.data_ptr<float>(),
                   d_logits.data_ptr<float>(), grad_value.data_ptr<q_t>(), batch, num_queries, height, width,
-                  heads, dim, dim_value, kh, kw, offset_scale_y, offset_scale_x, attn_scale, norm_eps,
-                  norm_before_rope);
+                  heads, dim, dim_value, kh, kw, offset_scale_y, offset_scale_x, key_resolution,
+                  attn_scale, norm_eps, norm_before_rope);
               qn_backward_query_key_kernel<q_t, c_t><<<grid, kQueryNeighborThreads, qk_smem, stream>>>(
                   query.data_ptr<q_t>(), key.data_ptr<q_t>(), coords.data_ptr<c_t>(), q_weight.data_ptr<q_t>(),
                   k_weight.data_ptr<q_t>(), rope_freqs.data_ptr<q_t>(), d_logits.data_ptr<float>(),
                   grad_query.data_ptr<q_t>(), grad_key.data_ptr<q_t>(), grad_q_weight_acc.data_ptr<float>(),
                   grad_k_weight_acc.data_ptr<float>(), grad_rope_freqs_acc.data_ptr<float>(), batch, num_queries,
-                  height, width, heads, dim, kh, kw, offset_scale_y, offset_scale_x, norm_eps,
+                  height, width, heads, dim, kh, kw, offset_scale_y, offset_scale_x, key_resolution, norm_eps,
                   norm_before_rope);
             });
       });

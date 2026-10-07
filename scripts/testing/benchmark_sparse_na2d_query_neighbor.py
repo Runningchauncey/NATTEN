@@ -58,9 +58,12 @@ def make_function(args: argparse.Namespace) -> Callable[..., torch.Tensor]:
     scale = args.dim**-0.5
 
     if args.implementation == "query_neighbor":
+        geometry = {"neighborhood_resolution": args.neighborhood_resolution}
+        if args.neighborhood_resolution == "query":
+            geometry["query_resolution"] = query_resolution
         return lambda q, k, v, c, qw, kw, rf: natten.sparse_na2d_bilinear_query_neighbor(
             q, k, v, c, kernel_size, qw, kw, rf,
-            query_resolution=query_resolution, scale=scale,
+            scale=scale, **geometry,
         )
     if args.implementation == "materialized":
         return lambda q, k, v, c, qw, kw, rf: sparse_na2d_bilinear_query_neighbor_pytorch(
@@ -208,7 +211,11 @@ def run_child(args: argparse.Namespace) -> dict:
     memory["backward"] = memory_sample(backward_peak, baseline)
 
     return {
-        "implementation": args.implementation,
+        "implementation": (
+            f"query_neighbor_{args.neighborhood_resolution}"
+            if args.implementation == "query_neighbor"
+            else args.implementation
+        ),
         "dtype": args.dtype,
         "forward_ms": forward,
         "backward_ms": backward,
@@ -261,6 +268,9 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=37)
     parser.add_argument("--query-height", type=int, default=259)
     parser.add_argument("--query-width", type=int, default=259)
+    parser.add_argument(
+        "--neighborhood-resolution", choices=("query", "key"), default="query"
+    )
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--dim", type=int, default=32)
     parser.add_argument("--dim-value", type=int, default=192)

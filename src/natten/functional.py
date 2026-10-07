@@ -20,7 +20,7 @@
 # SOFTWARE.
 #
 #################################################################################################
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -316,6 +316,7 @@ class SparseNa2dBilinearQueryNeighborAutogradFn(Function):
         kernel_size: Tuple[int, int],
         offset_scale_y: float,
         offset_scale_x: float,
+        key_resolution: bool,
         scale: float,
         qk_norm_eps: float,
         qk_norm_before_rope: bool,
@@ -344,6 +345,7 @@ class SparseNa2dBilinearQueryNeighborAutogradFn(Function):
             list(kernel_size),
             offset_scale_y,
             offset_scale_x,
+            key_resolution,
             scale,
             qk_norm_eps,
             qk_norm_before_rope,
@@ -362,6 +364,7 @@ class SparseNa2dBilinearQueryNeighborAutogradFn(Function):
         ctx.kernel_size = kernel_size
         ctx.offset_scale_y = offset_scale_y
         ctx.offset_scale_x = offset_scale_x
+        ctx.key_resolution = key_resolution
         ctx.scale = scale
         ctx.qk_norm_eps = qk_norm_eps
         ctx.qk_norm_before_rope = qk_norm_before_rope
@@ -396,6 +399,7 @@ class SparseNa2dBilinearQueryNeighborAutogradFn(Function):
             list(ctx.kernel_size),
             ctx.offset_scale_y,
             ctx.offset_scale_x,
+            ctx.key_resolution,
             ctx.scale,
             ctx.qk_norm_eps,
             ctx.qk_norm_before_rope,
@@ -409,6 +413,7 @@ class SparseNa2dBilinearQueryNeighborAutogradFn(Function):
             grad_q_weight,
             grad_k_weight,
             grad_rope,
+            None,
             None,
             None,
             None,
@@ -605,6 +610,7 @@ def sparse_na2d_bilinear_query_neighbor(
     rope_freqs: Tensor,
     query_resolution: Optional[Tuple[int, int]] = None,
     offset_scale: Optional[Tuple[float, float]] = None,
+    neighborhood_resolution: Literal["query", "key"] = "query",
     scale: Optional[float] = None,
     qk_norm_eps: Optional[float] = 1e-5,
     qk_norm_before_rope: bool = True,
@@ -612,10 +618,11 @@ def sparse_na2d_bilinear_query_neighbor(
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Fused bilinear sparse attention with query-neighbor spacing, RMSNorm, and RoPE.
 
-    Neighborhood offsets are measured in normalized coordinate units. Passing
-    ``query_resolution=(Hq, Wq)`` uses steps ``(2 / Hq, 2 / Wq)``; direct
-    ``offset_scale=(step_y, step_x)`` is also supported. Sampling follows
-    ``grid_sample`` border behavior with ``align_corners=False``.
+    ``neighborhood_resolution="query"`` measures offsets in query pixels and
+    requires either ``query_resolution=(Hq, Wq)`` or direct normalized
+    ``offset_scale=(step_y, step_x)``. ``neighborhood_resolution="key"`` uses
+    integer key-map pixel offsets. Sampling follows ``grid_sample`` border
+    behavior with ``align_corners=False``.
 
     BF16 queries use an FP32 compatibility path internally. This matches the
     materialized autocast path, where CUDA ``grid_sample`` promotes dense key
@@ -641,6 +648,17 @@ def sparse_na2d_bilinear_query_neighbor(
         kernel_size,
         op_name="sparse_na2d_bilinear_query_neighbor",
     )
+    if neighborhood_resolution not in ("query", "key"):
+        raise ValueError(
+            "neighborhood_resolution must be 'query' or 'key', "
+            f"got {neighborhood_resolution!r}."
+        )
+    key_resolution = neighborhood_resolution == "key"
+    if key_resolution and (query_resolution is not None or offset_scale is not None):
+        raise ValueError(
+            "query_resolution and offset_scale must be omitted when "
+            "neighborhood_resolution='key'."
+        )
     if query_resolution is not None and offset_scale is not None:
         raise ValueError("query_resolution and offset_scale are mutually exclusive.")
     if query_resolution is not None:
@@ -648,7 +666,12 @@ def sparse_na2d_bilinear_query_neighbor(
             raise ValueError(f"query_resolution must contain two positive values, got {query_resolution}.")
         offset_scale = (2.0 / int(query_resolution[0]), 2.0 / int(query_resolution[1]))
     elif offset_scale is None:
-        offset_scale = (2.0 / key.shape[1], 2.0 / key.shape[2])
+        if not key_resolution:
+            raise ValueError(
+                "query_resolution or offset_scale is required when "
+                "neighborhood_resolution='query'."
+            )
+        offset_scale = (0.0, 0.0)
     else:
         if len(offset_scale) != 2 or any(float(step) < 0 for step in offset_scale):
             raise ValueError(f"offset_scale must contain two non-negative values, got {offset_scale}.")
@@ -689,6 +712,7 @@ def sparse_na2d_bilinear_query_neighbor(
         kernel_size,
         float(offset_scale[0]),
         float(offset_scale[1]),
+        key_resolution,
         scale,
         qk_norm_eps,
         qk_norm_before_rope,

@@ -564,7 +564,10 @@ def test_sparse_na2d_does_not_break_dense_na2d_smoke():
 
 @pytest.mark.parametrize("kernel_size", [(3, 3), (3, 5)])
 @pytest.mark.parametrize("qk_norm_before_rope", [True, False])
-def test_sparse_na2d_bilinear_query_neighbor_matches_reference(kernel_size, qk_norm_before_rope):
+@pytest.mark.parametrize("neighborhood_resolution", ["query", "key"])
+def test_sparse_na2d_bilinear_query_neighbor_matches_reference(
+    kernel_size, qk_norm_before_rope, neighborhood_resolution
+):
     torch.manual_seed(11)
     shapes = (1, 6, 5, 7, 4, 4, 6)
     batch, num_queries, height, width, heads, dim, dim_value = shapes
@@ -582,6 +585,9 @@ def test_sparse_na2d_bilinear_query_neighbor_matches_reference(kernel_size, qk_n
         device="cuda",
     )
     grad = torch.randn(batch, num_queries, heads, dim_value, device="cuda")
+    geometry = {"neighborhood_resolution": neighborhood_resolution}
+    if neighborhood_resolution == "query":
+        geometry["query_resolution"] = (13, 17)
 
     actual, actual_lse = natten.sparse_na2d_bilinear_query_neighbor(
         query,
@@ -592,10 +598,10 @@ def test_sparse_na2d_bilinear_query_neighbor_matches_reference(kernel_size, qk_n
         q_weight,
         k_weight,
         rope_freqs,
-        query_resolution=(13, 17),
         qk_norm_eps=1e-6,
         qk_norm_before_rope=qk_norm_before_rope,
         return_lse=True,
+        **geometry,
     )
     actual.backward(grad)
     actual_grads = [tensor.grad.detach().clone() for tensor in tensors]
@@ -610,10 +616,10 @@ def test_sparse_na2d_bilinear_query_neighbor_matches_reference(kernel_size, qk_n
         reference_tensors[3],
         reference_tensors[4],
         reference_tensors[5],
-        query_resolution=(13, 17),
         qk_norm_eps=1e-6,
         qk_norm_before_rope=qk_norm_before_rope,
         return_lse=True,
+        **geometry,
     )
     expected.backward(grad)
 
@@ -771,7 +777,9 @@ def test_sparse_na2d_bilinear_query_neighbor_default_qk_norm_eps():
     rope_freqs = torch.randn(2, 16, device="cuda")
     args = (query, key, value, coords, (3, 3), q_weight, k_weight, rope_freqs)
 
-    default = natten.sparse_na2d_bilinear_query_neighbor(*args)
-    explicit = natten.sparse_na2d_bilinear_query_neighbor(*args, qk_norm_eps=1e-5)
+    default = natten.sparse_na2d_bilinear_query_neighbor(*args, query_resolution=(11, 13))
+    explicit = natten.sparse_na2d_bilinear_query_neighbor(
+        *args, query_resolution=(11, 13), qk_norm_eps=1e-5
+    )
 
     torch.testing.assert_close(default, explicit, rtol=0, atol=0)

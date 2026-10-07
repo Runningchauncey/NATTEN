@@ -21,7 +21,7 @@
 #
 #################################################################################################
 
-from typing import Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -336,6 +336,7 @@ def sparse_na2d_bilinear_query_neighbor_pytorch(
     rope_freqs: Tensor,
     query_resolution: Optional[Tuple[int, int]] = None,
     offset_scale: Optional[Tuple[float, float]] = None,
+    neighborhood_resolution: Literal["query", "key"] = "query",
     scale: Optional[float] = None,
     qk_norm_eps: Optional[float] = 1e-5,
     qk_norm_before_rope: bool = True,
@@ -346,20 +347,46 @@ def sparse_na2d_bilinear_query_neighbor_pytorch(
         kernel_size = (kernel_size, kernel_size)
     else:
         kernel_size = tuple(kernel_size)
+    if neighborhood_resolution not in ("query", "key"):
+        raise ValueError(
+            "neighborhood_resolution must be 'query' or 'key', "
+            f"got {neighborhood_resolution!r}."
+        )
+    key_resolution = neighborhood_resolution == "key"
+    if key_resolution and (query_resolution is not None or offset_scale is not None):
+        raise ValueError(
+            "query_resolution and offset_scale must be omitted when "
+            "neighborhood_resolution='key'."
+        )
     if query_resolution is not None and offset_scale is not None:
         raise ValueError("query_resolution and offset_scale are mutually exclusive.")
     _, height, width, heads, dim = key.shape
     if query_resolution is not None:
         offset_scale = (2.0 / query_resolution[0], 2.0 / query_resolution[1])
-    elif offset_scale is None:
-        offset_scale = (2.0 / height, 2.0 / width)
+    elif offset_scale is None and not key_resolution:
+        raise ValueError(
+            "query_resolution or offset_scale is required when "
+            "neighborhood_resolution='query'."
+        )
 
     kh, kw = kernel_size
     oy = torch.arange(-(kh // 2), kh // 2 + 1, device=coords.device, dtype=coords.dtype)
     ox = torch.arange(-(kw // 2), kw // 2 + 1, device=coords.device, dtype=coords.dtype)
     yy, xx = torch.meshgrid(oy, ox, indexing="ij")
-    sample_y = (coords[..., 0, None] + yy.reshape(-1) * offset_scale[0]).clamp(-1, 1)
-    sample_x = (coords[..., 1, None] + xx.reshape(-1) * offset_scale[1]).clamp(-1, 1)
+    if key_resolution:
+        center_y = ((coords[..., 0] + 1) * 0.5 * height - 0.5).clamp(0, height - 1)
+        center_x = ((coords[..., 1] + 1) * 0.5 * width - 0.5).clamp(0, width - 1)
+        pixel_y = (center_y[..., None] + yy.reshape(-1)).clamp(0, height - 1)
+        pixel_x = (center_x[..., None] + xx.reshape(-1)).clamp(0, width - 1)
+        sample_y = (pixel_y + 0.5) * (2.0 / height) - 1.0
+        sample_x = (pixel_x + 0.5) * (2.0 / width) - 1.0
+        key_pos_y = pixel_y / max(height - 1, 1)
+        key_pos_x = pixel_x / max(width - 1, 1)
+    else:
+        sample_y = (coords[..., 0, None] + yy.reshape(-1) * offset_scale[0]).clamp(-1, 1)
+        sample_x = (coords[..., 1, None] + xx.reshape(-1) * offset_scale[1]).clamp(-1, 1)
+        key_pos_y = (sample_y + 1.0) * 0.5
+        key_pos_x = (sample_x + 1.0) * 0.5
     sample_grid = torch.stack((sample_x, sample_y), dim=-1)
     key_local = sample_sparse_na2d_neighborhood(key, sample_grid)
     value_local = sample_sparse_na2d_neighborhood(value, sample_grid)
@@ -369,7 +396,7 @@ def sparse_na2d_bilinear_query_neighbor_pytorch(
     query_full = query.reshape(batch, num_queries, channels)
     key_full = key_local.reshape(batch, num_queries, kh * kw, channels)
     q_pos = ((coords + 1.0) * 0.5).to(query.dtype)
-    k_pos = torch.stack(((sample_y + 1.0) * 0.5, (sample_x + 1.0) * 0.5), dim=-1).to(query.dtype)
+    k_pos = torch.stack((key_pos_y, key_pos_x), dim=-1).to(query.dtype)
     q_weight = q_norm_weight.to(query.dtype)
     k_weight = k_norm_weight.to(query.dtype)
     freqs = rope_freqs.to(query.dtype)

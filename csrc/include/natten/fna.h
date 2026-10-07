@@ -121,6 +121,7 @@ void sparse_na2d_bilinear_query_neighbor_forward(
     const std::tuple<int32_t, int32_t>& kernel_size,
     float offset_scale_y,
     float offset_scale_x,
+    bool key_resolution,
     float attn_scale,
     float norm_eps,
     bool norm_before_rope);
@@ -261,6 +262,7 @@ void sparse_na2d_bilinear_query_neighbor_backward(
     const std::tuple<int32_t, int32_t>& kernel_size,
     float offset_scale_y,
     float offset_scale_x,
+    bool key_resolution,
     float attn_scale,
     float norm_eps,
     bool norm_before_rope);

@@ -1750,6 +1750,7 @@ def sparse_na2d_bilinear_query_neighbor_forward_torch_op(
     kernel_size: list[int],
     offset_scale_y: float,
     offset_scale_x: float,
+    key_resolution: bool,
     scale: float,
     norm_eps: float,
     norm_before_rope: bool,
@@ -1777,6 +1778,7 @@ def sparse_na2d_bilinear_query_neighbor_forward_torch_op(
         kernel_size,
         offset_scale_y,
         offset_scale_x,
+        key_resolution,
         scale,
         norm_eps,
         norm_before_rope,
@@ -1796,12 +1798,13 @@ def sparse_na2d_bilinear_query_neighbor_forward_torch_fake_op(
     kernel_size: list[int],
     offset_scale_y: float,
     offset_scale_x: float,
+    key_resolution: bool,
     scale: float,
     norm_eps: float,
     norm_before_rope: bool,
 ) -> Tuple[Tensor, Tensor]:
     del coords, q_norm_weight, k_norm_weight, rope_freqs, kernel_size
-    del offset_scale_y, offset_scale_x, scale, norm_eps, norm_before_rope
+    del offset_scale_y, offset_scale_x, key_resolution, scale, norm_eps, norm_before_rope
     return (
         torch.empty(
             [query.shape[0], query.shape[1], query.shape[2], value.shape[-1]],
@@ -1831,6 +1834,7 @@ def sparse_na2d_bilinear_query_neighbor_backward_torch_op(
     kernel_size: list[int],
     offset_scale_y: float,
     offset_scale_x: float,
+    key_resolution: bool,
     scale: float,
     norm_eps: float,
     norm_before_rope: bool,
@@ -1885,6 +1889,7 @@ def sparse_na2d_bilinear_query_neighbor_backward_torch_op(
         kernel_size,
         offset_scale_y,
         offset_scale_x,
+        key_resolution,
         scale,
         norm_eps,
         norm_before_rope,
@@ -1907,12 +1912,13 @@ def sparse_na2d_bilinear_query_neighbor_backward_torch_fake_op(
     kernel_size: list[int],
     offset_scale_y: float,
     offset_scale_x: float,
+    key_resolution: bool,
     scale: float,
     norm_eps: float,
     norm_before_rope: bool,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     del coords, output, d_output, logsumexp, kernel_size
-    del offset_scale_y, offset_scale_x, scale, norm_eps, norm_before_rope
+    del offset_scale_y, offset_scale_x, key_resolution, scale, norm_eps, norm_before_rope
     return (
         torch.empty_like(query),
         torch.empty_like(key),
